@@ -18,7 +18,6 @@ package v1beta1
 
 import (
 	"context"
-	"fmt"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -3543,74 +3542,60 @@ func TestPipelineTasksExecutionStatus(t *testing.T) {
 }
 
 // TestMatrixIncompatibleAPIVersions exercises validation of matrix
-// that requires alpha feature gate version in order to work.
+// that requires alpha/beta feature gate version in order to work.
 func TestMatrixIncompatibleAPIVersions(t *testing.T) {
+	task := PipelineTask{
+		Name:    "a-task",
+		TaskRef: &TaskRef{Name: "a-task"},
+		Matrix: &Matrix{
+			Params: Params{{
+				Name: "a-param", Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"foo", "bar"}},
+			}}},
+	}
 	tests := []struct {
-		name            string
-		requiredVersion string
-		spec            PipelineSpec
+		name    string
+		pt      PipelineTask
+		version string
+		wantErr *apis.FieldError
 	}{{
-		name:            "matrix requires alpha - check tasks",
-		requiredVersion: "alpha",
-		spec: PipelineSpec{
-			Tasks: PipelineTaskList{{
-				Name:    "a-task",
-				TaskRef: &TaskRef{Name: "a-task"},
-				Matrix: &Matrix{
-					Params: Params{{
-						Name: "a-param", Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"foo", "bar"}},
-					}}},
-			}},
-		},
+		name:    "matrix can work with alpha",
+		pt:      task,
+		version: config.AlphaAPIFields,
 	}, {
-		name:            "matrix requires alpha - check finally tasks",
-		requiredVersion: "alpha",
-		spec: PipelineSpec{
-			Tasks: PipelineTaskList{{
-				Name:    "a-task",
-				TaskRef: &TaskRef{Name: "a-task"},
-			}},
-			Finally: PipelineTaskList{{
-				Name:    "b-task",
-				TaskRef: &TaskRef{Name: "b-task"},
-				Matrix: &Matrix{
-					Params: Params{{
-						Name: "a-param", Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"foo", "bar"}},
-					}}},
-			}},
-		},
+		name:    "matrix requires beta",
+		pt:      task,
+		version: config.BetaAPIFields,
+	}, {
+		name:    "matrix not allowed with stable version",
+		pt:      task,
+		version: config.StableAPIFields,
+		wantErr: apis.ErrGeneric("matrix requires \"enable-api-fields\" feature gate to be \"alpha\" or \"beta\" but it is \"stable\""),
 	}}
-	versions := []string{"alpha", "stable"}
-	for _, tt := range tests {
-		for _, version := range versions {
-			testName := fmt.Sprintf("(using %s) %s", version, tt.name)
-			t.Run(testName, func(t *testing.T) {
-				ps := tt.spec
-				featureFlags, _ := config.NewFeatureFlagsFromMap(map[string]string{
-					"enable-api-fields": version,
-				})
-				defaults := &config.Defaults{
-					DefaultMaxMatrixCombinationsCount: 4,
-				}
-				cfg := &config.Config{
-					FeatureFlags: featureFlags,
-					Defaults:     defaults,
-				}
 
-				ctx := config.ToContext(context.Background(), cfg)
-
-				ps.SetDefaults(ctx)
-				err := ps.Validate(ctx)
-
-				if tt.requiredVersion != version && err == nil {
-					t.Fatalf("no error received even though version required is %q while feature gate is %q", tt.requiredVersion, version)
-				}
-
-				if tt.requiredVersion == version && err != nil {
-					t.Fatalf("error received despite required version and feature gate matching %q: %v", version, err)
-				}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			defaults := &config.Defaults{
+				DefaultMaxMatrixCombinationsCount: 4,
+			}
+			featureFlags, _ := config.NewFeatureFlagsFromMap(map[string]string{
+				"enable-api-fields": test.version,
 			})
-		}
+			cfg := &config.Config{
+				Defaults:     defaults,
+				FeatureFlags: featureFlags,
+			}
+			ctx := config.ToContext(context.Background(), cfg)
+			err := test.pt.validateMatrix(ctx)
+			if test.wantErr != nil {
+				if d := cmp.Diff(test.wantErr.Error(), err.Error()); d != "" {
+					t.Error(diff.PrintWantGot(d))
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("PipelineTask.validateMatrix() error = %v", err)
+				}
+			}
+		})
 	}
 }
 
@@ -3618,6 +3603,7 @@ func Test_validateMatrix(t *testing.T) {
 	tests := []struct {
 		name     string
 		tasks    []PipelineTask
+		finally  []PipelineTask
 		wantErrs *apis.FieldError
 	}{{
 		name: "parameter in both matrix and params",
@@ -3673,35 +3659,7 @@ func Test_validateMatrix(t *testing.T) {
 					Name: "a-param", Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"$(tasks.foo-task.results.a-task-results[*])"}},
 				}}},
 		}},
-	}}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			featureFlags, _ := config.NewFeatureFlagsFromMap(map[string]string{
-				"enable-api-fields": "alpha",
-			})
-			defaults := &config.Defaults{
-				DefaultMaxMatrixCombinationsCount: 4,
-			}
-			cfg := &config.Config{
-				FeatureFlags: featureFlags,
-				Defaults:     defaults,
-			}
-
-			ctx := config.ToContext(context.Background(), cfg)
-			if d := cmp.Diff(tt.wantErrs.Error(), validateMatrix(ctx, tt.tasks).Error()); d != "" {
-				t.Errorf("validateMatrix() errors diff %s", diff.PrintWantGot(d))
-			}
-		})
-	}
-}
-
-func Test_validateResultsFromMatrixedPipelineTasksNotConsumed(t *testing.T) {
-	tests := []struct {
-		name     string
-		tasks    []PipelineTask
-		finally  []PipelineTask
-		wantErrs *apis.FieldError
-	}{{
+	}, {
 		name: "results from matrixed task consumed in tasks through parameters",
 		tasks: PipelineTaskList{{
 			Name:    "a-task",
@@ -3714,13 +3672,9 @@ func Test_validateResultsFromMatrixedPipelineTasksNotConsumed(t *testing.T) {
 			Name:    "b-task",
 			TaskRef: &TaskRef{Name: "b-task"},
 			Params: Params{{
-				Name: "b-param", Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"$(tasks.a-task.results.a-result)"}},
+				Name: "b-param", Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"$(tasks.a-task.results.a-result[*])"}},
 			}},
 		}},
-		wantErrs: &apis.FieldError{
-			Message: "invalid value: consuming results from matrixed task a-task is not allowed",
-			Paths:   []string{"tasks[1]"},
-		},
 	}, {
 		name: "results from matrixed task consumed in finally through parameters",
 		tasks: PipelineTaskList{{
@@ -3735,13 +3689,9 @@ func Test_validateResultsFromMatrixedPipelineTasksNotConsumed(t *testing.T) {
 			Name:    "b-task",
 			TaskRef: &TaskRef{Name: "b-task"},
 			Params: Params{{
-				Name: "b-param", Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"$(tasks.a-task.results.a-result)"}},
+				Name: "b-param", Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"$(tasks.a-task.results.a-result[*])"}},
 			}},
 		}},
-		wantErrs: &apis.FieldError{
-			Message: "invalid value: consuming results from matrixed task a-task is not allowed",
-			Paths:   []string{"finally[0]"},
-		},
 	}, {
 		name: "results from matrixed task consumed in tasks and finally through parameters",
 		tasks: PipelineTaskList{{
@@ -3755,20 +3705,16 @@ func Test_validateResultsFromMatrixedPipelineTasksNotConsumed(t *testing.T) {
 			Name:    "b-task",
 			TaskRef: &TaskRef{Name: "b-task"},
 			Params: Params{{
-				Name: "b-param", Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"$(tasks.a-task.results.a-result)"}},
+				Name: "b-param", Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"$(tasks.a-task.results.a-result[*])"}},
 			}},
 		}},
 		finally: PipelineTaskList{{
 			Name:    "c-task",
 			TaskRef: &TaskRef{Name: "c-task"},
 			Params: Params{{
-				Name: "b-param", Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"$(tasks.a-task.results.a-result)"}},
+				Name: "b-param", Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"$(tasks.a-task.results.a-result[*])"}},
 			}},
 		}},
-		wantErrs: &apis.FieldError{
-			Message: "invalid value: consuming results from matrixed task a-task is not allowed",
-			Paths:   []string{"tasks[1]", "finally[0]"},
-		},
 	}, {
 		name: "results from matrixed task consumed in tasks through when expressions",
 		tasks: PipelineTaskList{{
@@ -3784,13 +3730,9 @@ func Test_validateResultsFromMatrixedPipelineTasksNotConsumed(t *testing.T) {
 			WhenExpressions: WhenExpressions{{
 				Input:    "foo",
 				Operator: selection.In,
-				Values:   []string{"$(tasks.a-task.results.a-result)"},
+				Values:   []string{"$(tasks.a-task.results.a-result[*])"},
 			}},
 		}},
-		wantErrs: &apis.FieldError{
-			Message: "invalid value: consuming results from matrixed task a-task is not allowed",
-			Paths:   []string{"tasks[1]"},
-		},
 	}, {
 		name: "results from matrixed task consumed in finally through when expressions",
 		tasks: PipelineTaskList{{
@@ -3805,15 +3747,11 @@ func Test_validateResultsFromMatrixedPipelineTasksNotConsumed(t *testing.T) {
 			Name:    "b-task",
 			TaskRef: &TaskRef{Name: "b-task"},
 			WhenExpressions: WhenExpressions{{
-				Input:    "$(tasks.a-task.results.a-result)",
+				Input:    "$(tasks.a-task.results.a-result[*])",
 				Operator: selection.In,
 				Values:   []string{"foo", "bar"},
 			}},
 		}},
-		wantErrs: &apis.FieldError{
-			Message: "invalid value: consuming results from matrixed task a-task is not allowed",
-			Paths:   []string{"finally[0]"},
-		},
 	}, {
 		name: "results from matrixed task consumed in tasks and finally through when expressions",
 		tasks: PipelineTaskList{{
@@ -3827,7 +3765,7 @@ func Test_validateResultsFromMatrixedPipelineTasksNotConsumed(t *testing.T) {
 			Name:    "b-task",
 			TaskRef: &TaskRef{Name: "b-task"},
 			WhenExpressions: WhenExpressions{{
-				Input:    "$(tasks.a-task.results.a-result)",
+				Input:    "$(tasks.a-task.results.a-result[*])",
 				Operator: selection.In,
 				Values:   []string{"foo", "bar"},
 			}},
@@ -3838,18 +3776,320 @@ func Test_validateResultsFromMatrixedPipelineTasksNotConsumed(t *testing.T) {
 			WhenExpressions: WhenExpressions{{
 				Input:    "foo",
 				Operator: selection.In,
-				Values:   []string{"$(tasks.a-task.results.a-result)"},
+				Values:   []string{"$(tasks.a-task.results.a-result[*])"},
 			}},
 		}},
-		wantErrs: &apis.FieldError{
-			Message: "invalid value: consuming results from matrixed task a-task is not allowed",
-			Paths:   []string{"tasks[1]", "finally[0]"},
-		},
+	}, {
+		name: "valid matrix emitting string results consumed in aggregate by another pipelineTask",
+		finally: PipelineTaskList{{
+			Name:    "matrix-emitting-results",
+			TaskRef: &TaskRef{Name: "taskwithresult"},
+			Matrix: &Matrix{
+				Params: Params{{
+					Name: "platform", Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"linux", "mac"}},
+				}, {
+					Name: "browser", Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"chrome", "safari"}},
+				}}},
+		}, {
+			Name: "echoarrayurl",
+			TaskSpec: &EmbeddedTask{TaskSpec: TaskSpec{
+				Params: ParamSpecs{{
+					Name: "url", Type: "array",
+				}},
+				Steps: []Step{{
+					Name:  "use-environments",
+					Image: "bash:latest",
+					Args:  []string{"$(params.url[*])"},
+					Script: `for arg in "$@"; do
+						echo "URL: $arg"
+							done`,
+				}},
+			}},
+		}, {
+			Name: "taskwithresult",
+			TaskSpec: &EmbeddedTask{TaskSpec: TaskSpec{
+				Params: ParamSpecs{{
+					Name: "platform",
+				}, {
+					Name: "browser"}},
+				Results: []TaskResult{{
+					Name: "report-url",
+					Type: ResultsTypeString,
+				}},
+				Steps: []Step{{
+					Name:  "produce-report-url",
+					Image: "alpine",
+					Script: ` |
+							echo -n "https://api.example/get-report/$(params.platform)-$(params.browser)" | tee $(results.report-url.path)`}},
+			}},
+		}, {
+			Name:    "task-consuming-results",
+			TaskRef: &TaskRef{Name: "echoarrayurl"},
+			Params: Params{{
+				Name: "b-param", Value: ParamValue{Type: ParamTypeString, StringVal: "$(tasks.matrix-emitting-results.results.report-url[*])"},
+			}},
+		}, {
+			Name: "echoarrayurl",
+			TaskSpec: &EmbeddedTask{TaskSpec: TaskSpec{
+				Params: ParamSpecs{{
+					Name: "url", Type: "array",
+				}},
+				Steps: []Step{{
+					Name:  "use-environments",
+					Image: "bash:latest",
+					Args:  []string{"$(params.url[*])"},
+					Script: `for arg in "$@"; do
+					echo "URL: $arg"
+				done`,
+				}},
+			}},
+		}},
+	}, {
+		name: "valid matrix emitting string results consumed in aggregate by another pipelineTask (embedded taskSpec)",
+		tasks: PipelineTaskList{{
+			Name:    "matrix-emitting-results",
+			TaskRef: &TaskRef{Name: "taskwithresult"},
+			Matrix: &Matrix{
+				Params: Params{{
+					Name: "platform", Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"linux", "mac"}},
+				}, {
+					Name: "browser", Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"chrome", "safari"}},
+				}}},
+		}, {
+			Name: "task-consuming-results",
+			TaskSpec: &EmbeddedTask{TaskSpec: TaskSpec{
+				Params: ParamSpecs{{
+					Name: "url", Type: "array",
+				}},
+				Steps: []Step{{
+					Name:  "use-environments",
+					Image: "bash:latest",
+					Args:  []string{"$(params.url[*])"},
+					Script: `for arg in "$@"; do
+						echo "URL: $arg"
+							done`,
+				}},
+			}},
+			Params: Params{{
+				Name: "b-param", Value: ParamValue{Type: ParamTypeString, StringVal: "$(tasks.matrix-emitting-results.results.report-url[*])"},
+			}},
+		}},
+	}, {
+		name: "invalid matrix emitting stings results consumed using array indexing by another pipelineTask",
+		tasks: PipelineTaskList{{
+			Name:    "matrix-emitting-results",
+			TaskRef: &TaskRef{Name: "taskwithresult"},
+			Matrix: &Matrix{
+				Params: Params{{
+					Name: "platform", Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"linux", "mac"}},
+				}, {
+					Name: "browser", Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"chrome", "safari"}},
+				}}},
+		}, {
+			Name: "taskwithresult",
+			TaskSpec: &EmbeddedTask{TaskSpec: TaskSpec{
+				Params: ParamSpecs{{
+					Name: "platform",
+				}, {
+					Name: "browser"}},
+				Results: []TaskResult{{
+					Name: "report-url",
+					Type: ResultsTypeString,
+				}},
+				Steps: []Step{{
+					Name:  "produce-report-url",
+					Image: "alpine",
+					Script: ` |
+						echo -n "https://api.example/get-report/$(params.platform)-$(params.browser)" | tee $(results.report-url.path)`}},
+			}},
+		}, {
+			Name:    "task-consuming-results",
+			TaskRef: &TaskRef{Name: "echoarrayurl"},
+			Params: Params{{
+				Name: "b-param", Value: ParamValue{Type: ParamTypeString, StringVal: "$(tasks.matrix-emitting-results.results.report-url[0])"},
+			}},
+		}, {
+			Name: "echoarrayurl",
+			TaskSpec: &EmbeddedTask{TaskSpec: TaskSpec{
+				Params: ParamSpecs{{
+					Name: "url", Type: "array",
+				}},
+				Steps: []Step{{
+					Name:  "use-environments",
+					Image: "bash:latest",
+					Args:  []string{"$(params.url[*])"},
+					Script: `for arg in "$@"; do
+					echo "URL: $arg"
+				done`,
+				}},
+			}},
+		}},
+		wantErrs: apis.ErrGeneric("A matrixed pipelineTask can only be consumed in aggregate using [*] notation, but is currently set to tasks.matrix-emitting-results.results.report-url[0]"),
+	}, {
+		name: "invalid matrix emitting array results consumed in aggregate by another pipelineTask (embedded TaskSpec)",
+		tasks: PipelineTaskList{{
+			Name: "matrix-emitting-results-embedded",
+			TaskSpec: &EmbeddedTask{TaskSpec: TaskSpec{
+				Params: ParamSpecs{{
+					Name: "platform",
+				}, {
+					Name: "browser"}},
+				Results: []TaskResult{{
+					Name: "array-result",
+					Type: ResultsTypeArray,
+				}},
+				Steps: []Step{{
+					Name:  "produce-array-result",
+					Image: "alpine",
+					Script: ` |
+						echo -n "[\"${params.platform}\",\"${params.browser}\"]" | tee $(results.array-result.path)`}},
+			}},
+			Matrix: &Matrix{
+				Params: Params{{
+					Name: "platform", Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"linux", "mac"}},
+				}, {
+					Name: "browser", Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"chrome", "safari"}},
+				}}},
+		}, {
+			Name: "taskwithresult",
+			TaskSpec: &EmbeddedTask{TaskSpec: TaskSpec{
+				Params: ParamSpecs{{
+					Name: "platform",
+				}, {
+					Name: "browser"}},
+				Results: []TaskResult{{
+					Name: "array-result",
+					Type: ResultsTypeArray,
+				}},
+				Steps: []Step{{
+					Name:  "produce-array-result",
+					Image: "alpine",
+					Script: ` |
+						echo -n "https://api.example/get-report/$(params.platform)-$(params.browser)" | tee $(results.array-result.path)`}},
+			}},
+		}, {
+			Name:    "task-consuming-results",
+			TaskRef: &TaskRef{Name: "echoarrayurl"},
+			Params: Params{{
+				Name: "b-param", Value: ParamValue{Type: ParamTypeString, StringVal: "$(tasks.matrix-emitting-results-embedded.results.array-result[*])"},
+			}},
+		}, {
+			Name: "echoarrayurl",
+			TaskSpec: &EmbeddedTask{TaskSpec: TaskSpec{
+				Params: ParamSpecs{{
+					Name: "url", Type: "array",
+				}},
+				Steps: []Step{{
+					Name:  "use-environments",
+					Image: "bash:latest",
+					Args:  []string{"$(params.url[*])"},
+					Script: `for arg in "$@"; do
+					echo "URL: $arg"
+				done`,
+				}},
+			}},
+		}},
+		wantErrs: apis.ErrInvalidValue("Matrixed PipelineTasks emitting results must have an underlying type string, but result array-result has type array in pipelineTask", ""),
+	}, {
+		name: "invalid matrix emitting stings results consumed using array indexing by another pipelineTask (embedded TaskSpec)",
+		tasks: PipelineTaskList{{
+			Name: "matrix-emitting-results-embedded",
+			TaskSpec: &EmbeddedTask{TaskSpec: TaskSpec{
+				Params: ParamSpecs{{
+					Name: "platform",
+				}, {
+					Name: "browser"}},
+				Results: []TaskResult{{
+					Name: "array-result",
+					Type: ResultsTypeArray,
+				}},
+				Steps: []Step{{
+					Name:  "produce-array-result",
+					Image: "alpine",
+					Script: ` |
+						echo -n "[\"${params.platform}\",\"${params.browser}\"]" | tee $(results.array-result.path)`}},
+			}},
+			Matrix: &Matrix{
+				Params: Params{{
+					Name: "platform", Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"linux", "mac"}},
+				}, {
+					Name: "browser", Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"chrome", "safari"}},
+				}}},
+		}, {
+			Name: "task-consuming-results",
+			TaskSpec: &EmbeddedTask{TaskSpec: TaskSpec{
+				Params: ParamSpecs{{
+					Name: "platform",
+				}, {
+					Name: "browser"}},
+				Results: []TaskResult{{
+					Name: "report-url",
+					Type: ResultsTypeString,
+				}},
+				Steps: []Step{{
+					Name:  "produce-report-url",
+					Image: "alpine",
+					Script: ` |
+							echo -n "https://api.example/get-report/$(params.platform)-$(params.browser)" | tee $(results.report-url.path)`}},
+			}},
+			Params: Params{{
+				Name: "b-param", Value: ParamValue{Type: ParamTypeString, StringVal: "$(tasks.matrix-emitting-results-embedded.results.report-url[0])"},
+			}},
+		}},
+		wantErrs: apis.ErrGeneric("A matrixed pipelineTask can only be consumed in aggregate using [*] notation, but is currently set to tasks.matrix-emitting-results-embedded.results.report-url[0]"),
+	}, {
+		name: "invalid matrix emitting array results consumed in aggregate by another pipelineTask",
+		tasks: PipelineTaskList{{
+			Name:    "matrix-emitting-results",
+			TaskRef: &TaskRef{Name: "taskwithresult"},
+			Matrix: &Matrix{
+				Params: Params{{
+					Name: "platform", Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"linux", "mac"}},
+				}, {
+					Name: "browser", Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"chrome", "safari"}},
+				}}},
+		}, {
+			Name: "taskwithresult",
+			TaskSpec: &EmbeddedTask{TaskSpec: TaskSpec{
+				Params: ParamSpecs{{
+					Name: "platform",
+				}, {
+					Name: "browser"}},
+				Results: []TaskResult{{
+					Name: "array-result",
+					Type: ResultsTypeArray,
+				}},
+				Steps: []Step{{
+					Name:  "produce-array-result",
+					Image: "alpine",
+					Script: ` |
+						echo -n "[\"${params.platform}\",\"${params.browser}\"]" | tee $(results.array-result.path)`}},
+			}},
+		}, {
+			Name:    "task-consuming-results",
+			TaskRef: &TaskRef{Name: "echoarrayurl"},
+			Params: Params{{
+				Name: "b-param", Value: ParamValue{Type: ParamTypeString, StringVal: "$(tasks.matrix-emitting-results.results.array-result[*])"},
+			}},
+		}},
+		wantErrs: apis.ErrInvalidValue("Matrixed PipelineTasks emitting results must have an underlying type string, but result array-result has type array in pipelineTask", ""),
 	}}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if d := cmp.Diff(tt.wantErrs.Error(), validateResultsFromMatrixedPipelineTasksNotConsumed(tt.tasks, tt.finally).Error()); d != "" {
-				t.Errorf("validateResultsFromMatrixedPipelineTasksNotConsumed() errors diff %s", diff.PrintWantGot(d))
+			featureFlags, _ := config.NewFeatureFlagsFromMap(map[string]string{
+				"enable-api-fields": "beta",
+			})
+			defaults := &config.Defaults{
+				DefaultMaxMatrixCombinationsCount: 4,
+			}
+			cfg := &config.Config{
+				FeatureFlags: featureFlags,
+				Defaults:     defaults,
+			}
+
+			ctx := config.ToContext(context.Background(), cfg)
+			if d := cmp.Diff(tt.wantErrs.Error(), validateMatrix(ctx, tt.tasks).Error()); d != "" {
+				t.Errorf("validateMatrix() errors diff %s", diff.PrintWantGot(d))
 			}
 		})
 	}
@@ -3876,6 +4116,209 @@ func enableFeatures(t *testing.T, features []string) func(context.Context) conte
 			Data:       data,
 		})
 		return s.ToContext(ctx)
+	}
+}
+
+// TestPipelineWithBetaFields tests the beta API-driven features of
+// PipelineSpec are correctly governed `enable-api-fields`, which must
+// be set to "alpha" or "beta".
+func TestPipelineWithBetaFields(t *testing.T) {
+	tts := []struct {
+		name string
+		spec PipelineSpec
+	}{{
+		name: "array indexing in Tasks",
+		spec: PipelineSpec{
+			Params: []ParamSpec{
+				{Name: "first-param", Type: ParamTypeArray, Default: NewStructuredValues("default-value", "default-value-again")},
+			},
+			Tasks: []PipelineTask{{
+				Name: "foo",
+				Params: Params{
+					{Name: "first-task-first-param", Value: *NewStructuredValues("$(params.first-param[0])")},
+				},
+				TaskRef: &TaskRef{Name: "foo"},
+			}},
+		},
+	}, {
+		name: "array indexing in Finally",
+		spec: PipelineSpec{
+			Params: []ParamSpec{
+				{Name: "first-param", Type: ParamTypeArray, Default: NewStructuredValues("default-value", "default-value-again")},
+			},
+			Tasks: []PipelineTask{{
+				Name:    "foo",
+				TaskRef: &TaskRef{Name: "foo"},
+			}},
+			Finally: []PipelineTask{{
+				Name: "bar",
+				Params: Params{
+					{Name: "first-task-first-param", Value: *NewStructuredValues("$(params.first-param[0])")},
+				},
+				TaskRef: &TaskRef{Name: "bar"},
+			}},
+		},
+	}, {
+		name: "pipeline tasks - use of resolver",
+		spec: PipelineSpec{
+			Tasks: []PipelineTask{{
+				Name:    "uses-resolver",
+				TaskRef: &TaskRef{ResolverRef: ResolverRef{Resolver: "bar"}},
+			}},
+		},
+	}, {
+		name: "pipeline tasks - use of resolver params",
+		spec: PipelineSpec{
+			Tasks: []PipelineTask{{
+				Name:    "uses-resolver-params",
+				TaskRef: &TaskRef{ResolverRef: ResolverRef{Resolver: "bar", Params: Params{{}}}},
+			}},
+		},
+	}, {
+		name: "finally tasks - use of resolver",
+		spec: PipelineSpec{
+			Tasks: []PipelineTask{{
+				Name:    "valid-pipeline-task",
+				TaskRef: &TaskRef{Name: "foo-task"},
+			}},
+			Finally: []PipelineTask{{
+				Name:    "uses-resolver",
+				TaskRef: &TaskRef{ResolverRef: ResolverRef{Resolver: "bar"}},
+			}},
+		},
+	}, {
+		name: "finally tasks - use of resolver params",
+		spec: PipelineSpec{
+			Tasks: []PipelineTask{{
+				Name:    "valid-pipeline-task",
+				TaskRef: &TaskRef{Name: "foo-task"},
+			}},
+			Finally: []PipelineTask{{
+				Name:    "uses-resolver-params",
+				TaskRef: &TaskRef{ResolverRef: ResolverRef{Resolver: "bar", Params: Params{{}}}},
+			}},
+		},
+	}, {
+		name: "object params",
+		spec: PipelineSpec{
+			Params: []ParamSpec{
+				{Name: "first-param", Type: ParamTypeObject, Properties: map[string]PropertySpec{}},
+			},
+			Tasks: []PipelineTask{{
+				Name:    "foo",
+				TaskRef: &TaskRef{Name: "foo"},
+			}},
+		},
+	}, {
+		name: "object params in Tasks",
+		spec: PipelineSpec{
+			Tasks: []PipelineTask{{
+				Name: "valid-pipeline-task",
+				TaskSpec: &EmbeddedTask{TaskSpec: TaskSpec{
+					Steps:  []Step{{Image: "busybox", Script: "echo hello"}},
+					Params: []ParamSpec{{Name: "my-object-param", Type: ParamTypeObject, Properties: map[string]PropertySpec{}}},
+				}},
+			}},
+		},
+	}, {
+		name: "object params in Finally",
+		spec: PipelineSpec{
+			Tasks: []PipelineTask{{
+				Name:    "foo",
+				TaskRef: &TaskRef{Name: "foo"},
+			}},
+			Finally: []PipelineTask{{
+				Name: "valid-finally-task",
+				TaskSpec: &EmbeddedTask{TaskSpec: TaskSpec{
+					Steps:  []Step{{Image: "busybox", Script: "echo hello"}},
+					Params: []ParamSpec{{Name: "my-object-param", Type: ParamTypeObject, Properties: map[string]PropertySpec{}}},
+				}},
+			}},
+		},
+	}, {
+		name: "array results",
+		spec: PipelineSpec{
+			Tasks: []PipelineTask{{
+				Name:    "valid-pipeline-task",
+				TaskRef: &TaskRef{Name: "foo-task"},
+			}},
+			Results: []PipelineResult{{Name: "my-array-result", Type: ResultsTypeArray, Value: *NewStructuredValues("$(tasks.valid-pipeline-task.results.foo[*])")}},
+		},
+	}, {
+		name: "array results in Tasks",
+		spec: PipelineSpec{
+			Tasks: []PipelineTask{{
+				Name: "valid-pipeline-task",
+				TaskSpec: &EmbeddedTask{TaskSpec: TaskSpec{
+					Steps:   []Step{{Image: "busybox", Script: "echo hello"}},
+					Results: []TaskResult{{Name: "my-array-result", Type: ResultsTypeArray}},
+				}},
+			}},
+		},
+	}, {
+		name: "array results in Finally",
+		spec: PipelineSpec{
+			Tasks: []PipelineTask{{
+				Name:    "valid-pipeline-task",
+				TaskRef: &TaskRef{Name: "foo-task"},
+			}},
+			Finally: []PipelineTask{{
+				Name: "valid-finally-task",
+				TaskSpec: &EmbeddedTask{TaskSpec: TaskSpec{
+					Steps:   []Step{{Image: "busybox", Script: "echo hello"}},
+					Results: []TaskResult{{Name: "my-array-result", Type: ResultsTypeArray}},
+				}},
+			}},
+		},
+	}, {
+		name: "object results",
+		spec: PipelineSpec{
+			Tasks: []PipelineTask{{
+				Name:    "valid-pipeline-task",
+				TaskRef: &TaskRef{Name: "foo-task"},
+			}},
+			Results: []PipelineResult{{Name: "my-object-result", Type: ResultsTypeObject, Value: *NewStructuredValues("$(tasks.valid-pipeline-task.results.foo[*])")}},
+		},
+	}, {
+		name: "object results in Tasks",
+		spec: PipelineSpec{
+			Tasks: []PipelineTask{{
+				Name: "valid-pipeline-task",
+				TaskSpec: &EmbeddedTask{TaskSpec: TaskSpec{
+					Steps:   []Step{{Image: "busybox", Script: "echo hello"}},
+					Results: []TaskResult{{Name: "my-object-result", Type: ResultsTypeObject, Properties: map[string]PropertySpec{}}},
+				}},
+			}},
+		},
+	}, {
+		name: "object results in Finally",
+		spec: PipelineSpec{
+			Tasks: []PipelineTask{{
+				Name:    "valid-pipeline-task",
+				TaskRef: &TaskRef{Name: "foo-task"},
+			}},
+			Finally: []PipelineTask{{
+				Name: "valid-finally-task",
+				TaskSpec: &EmbeddedTask{TaskSpec: TaskSpec{
+					Steps:   []Step{{Image: "busybox", Script: "echo hello"}},
+					Results: []TaskResult{{Name: "my-object-result", Type: ResultsTypeObject, Properties: map[string]PropertySpec{}}},
+				}},
+			}},
+		},
+	}}
+	for _, tt := range tts {
+		t.Run(tt.name, func(t *testing.T) {
+			pipeline := Pipeline{ObjectMeta: metav1.ObjectMeta{Name: "foo"}, Spec: tt.spec}
+			ctx := cfgtesting.EnableStableAPIFields(context.Background())
+			if err := pipeline.Validate(ctx); err == nil {
+				t.Errorf("no error when using beta field when `enable-api-fields` is stable")
+			}
+
+			ctx = cfgtesting.EnableBetaAPIFields(context.Background())
+			if err := pipeline.Validate(ctx); err != nil {
+				t.Errorf("unexpected error when using beta field: %s", err)
+			}
+		})
 	}
 }
 

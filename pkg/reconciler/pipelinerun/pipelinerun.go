@@ -276,7 +276,7 @@ func (c *Reconciler) ReconcileKind(ctx context.Context, pr *v1.PipelineRun) pkgr
 		waitTime := pr.PipelineTimeout(ctx) - elapsed
 		if pr.Status.FinallyStartTime == nil && pr.TasksTimeout() != nil {
 			waitTime = pr.TasksTimeout().Duration - elapsed
-		} else if pr.FinallyTimeout() != nil {
+		} else if pr.Status.FinallyStartTime != nil && pr.FinallyTimeout() != nil {
 			finallyWaitTime := pr.FinallyTimeout().Duration - c.Clock.Since(pr.Status.FinallyStartTime.Time)
 			if finallyWaitTime < waitTime {
 				waitTime = finallyWaitTime
@@ -325,10 +325,10 @@ func (c *Reconciler) resolvePipelineState(
 	ctx context.Context,
 	tasks []v1.PipelineTask,
 	pipelineMeta *metav1.ObjectMeta,
-	pr *v1.PipelineRun) (resources.PipelineRunState, error) {
+	pr *v1.PipelineRun,
+	pst resources.PipelineRunState) (resources.PipelineRunState, error) {
 	ctx, span := c.tracerProvider.Tracer(TracerName).Start(ctx, "resolvePipelineState")
 	defer span.End()
-	pst := resources.PipelineRunState{}
 	// Resolve each task individually because they each could have a different reference context (remote or local).
 	for _, task := range tasks {
 		// We need the TaskRun name to ensure that we don't perform an additional remote resolution request for a PipelineTask
@@ -536,7 +536,46 @@ func (c *Reconciler) reconcile(ctx context.Context, pr *v1.PipelineRun, getPipel
 	if len(pipelineSpec.Finally) > 0 {
 		tasks = append(tasks, pipelineSpec.Finally...)
 	}
-	pipelineRunState, err := c.resolvePipelineState(ctx, tasks, pipelineMeta.ObjectMeta, pr)
+
+	// We split tasks in two lists:
+	// - those with a completed (Task|Custom)Run reference (i.e. those that finished running)
+	// - those without a (Task|Custom)Run reference
+	// We resolve the status for the former first, to collect all results available at this stage
+	// We know that tasks in progress or completed have had their fan-out alteady calculated so
+	// they can be safely processed in the first iteration. The underlying assumption is that if
+	// a PipelineTask has at least one TaskRun associated, then all its TaskRuns have been
+	// created already.
+	// The second group takes as input the partial state built in the first iteration and finally
+	// the two results are collated
+	ranOrRunningTaskNames := sets.Set[string]{}
+	ranOrRunningTasks := []v1.PipelineTask{}
+	notStartedTasks := []v1.PipelineTask{}
+
+	for _, child := range pr.Status.ChildReferences {
+		ranOrRunningTaskNames.Insert(child.PipelineTaskName)
+	}
+	for _, task := range tasks {
+		if ranOrRunningTaskNames.Has(task.Name) {
+			ranOrRunningTasks = append(ranOrRunningTasks, task)
+		} else {
+			notStartedTasks = append(notStartedTasks, task)
+		}
+	}
+	// First iteration
+	pst := resources.PipelineRunState{}
+	pipelineRunState, err := c.resolvePipelineState(ctx, ranOrRunningTasks, pipelineMeta.ObjectMeta, pr, pst)
+	switch {
+	case errors.Is(err, remote.ErrRequestInProgress):
+		message := fmt.Sprintf("PipelineRun %s/%s awaiting remote resource", pr.Namespace, pr.Name)
+		pr.Status.MarkRunning(v1.TaskRunReasonResolvingTaskRef, message)
+		return nil
+	case err != nil:
+		return err
+	default:
+	}
+
+	// Second iteration
+	pipelineRunState, err = c.resolvePipelineState(ctx, notStartedTasks, pipelineMeta.ObjectMeta, pr, pipelineRunState)
 	switch {
 	case errors.Is(err, remote.ErrRequestInProgress):
 		message := fmt.Sprintf("PipelineRun %s/%s awaiting remote resource", pr.Namespace, pr.Name)
@@ -584,6 +623,16 @@ func (c *Reconciler) reconcile(ctx context.Context, pr *v1.PipelineRun, getPipel
 				pr.Status.MarkFailed(v1.PipelineRunReasonFailedValidation.String(), err.Error())
 				return controller.NewPermanentError(err)
 			}
+		}
+	}
+
+	// Evaluate the CEL of PipelineTask after the variable substitutions and validations.
+	for _, rpt := range pipelineRunFacts.State {
+		err := rpt.EvaluateCEL()
+		if err != nil {
+			logger.Errorf("Error evaluating CEL %s: %v", pr.Name, err)
+			pr.Status.MarkFailed(string(v1.PipelineRunReasonCELEvaluationFailed), err.Error())
+			return controller.NewPermanentError(err)
 		}
 	}
 
@@ -651,7 +700,7 @@ func (c *Reconciler) reconcile(ctx context.Context, pr *v1.PipelineRun, getPipel
 				errs := timeoutPipelineTasksForTaskNames(ctx, logger, pr, c.PipelineClientSet, tasksToTimeOut)
 				if len(errs) > 0 {
 					errString := strings.Join(errs, "\n")
-					logger.Errorf("Failed to timeout tasks for PipelineRun %s/%s: %s", pr.Name, pr.Name, errString)
+					logger.Errorf("Failed to timeout tasks for PipelineRun %s/%s: %s", pr.Namespace, pr.Name, errString)
 					return fmt.Errorf("error(s) from cancelling TaskRun(s) from PipelineRun %s: %s", pr.Name, errString)
 				}
 			}
@@ -668,7 +717,7 @@ func (c *Reconciler) reconcile(ctx context.Context, pr *v1.PipelineRun, getPipel
 			errs := timeoutPipelineTasksForTaskNames(ctx, logger, pr, c.PipelineClientSet, tasksToTimeOut)
 			if len(errs) > 0 {
 				errString := strings.Join(errs, "\n")
-				logger.Errorf("Failed to timeout finally tasks for PipelineRun %s/%s: %s", pr.Name, pr.Name, errString)
+				logger.Errorf("Failed to timeout finally tasks for PipelineRun %s/%s: %s", pr.Namespace, pr.Name, errString)
 				return fmt.Errorf("error(s) from cancelling TaskRun(s) from PipelineRun %s: %s", pr.Name, errString)
 			}
 		}
@@ -769,6 +818,9 @@ func (c *Reconciler) runNextSchedulableTask(ctx context.Context, pr *v1.Pipeline
 			continue
 		}
 
+		// propagate previous task results
+		resources.PropagateResults(rpt, pipelineRunFacts.State)
+
 		// Validate parameter types in matrix after apply substitutions from Task Results
 		if rpt.PipelineTask.IsMatrixed() {
 			if err := resources.ValidateParameterTypesInMatrix(pipelineRunFacts.State); err != nil {
@@ -779,14 +831,14 @@ func (c *Reconciler) runNextSchedulableTask(ctx context.Context, pr *v1.Pipeline
 		}
 
 		if rpt.IsCustomTask() {
-			rpt.CustomRuns, err = c.createCustomRuns(ctx, rpt, pr)
+			rpt.CustomRuns, err = c.createCustomRuns(ctx, rpt, pr, pipelineRunFacts)
 			if err != nil {
 				recorder.Eventf(pr, corev1.EventTypeWarning, "RunsCreationFailed", "Failed to create CustomRuns %q: %v", rpt.CustomRunNames, err)
 				err = fmt.Errorf("error creating CustomRuns called %s for PipelineTask %s from PipelineRun %s: %w", rpt.CustomRunNames, rpt.PipelineTask.Name, pr.Name, err)
 				return err
 			}
 		} else {
-			rpt.TaskRuns, err = c.createTaskRuns(ctx, rpt, pr)
+			rpt.TaskRuns, err = c.createTaskRuns(ctx, rpt, pr, pipelineRunFacts)
 			if err != nil {
 				recorder.Eventf(pr, corev1.EventTypeWarning, "TaskRunsCreationFailed", "Failed to create TaskRuns %q: %v", rpt.TaskRunNames, err)
 				err = fmt.Errorf("error creating TaskRuns called %s for PipelineTask %s from PipelineRun %s: %w", rpt.TaskRunNames, rpt.PipelineTask.Name, pr.Name, err)
@@ -807,7 +859,7 @@ func (c *Reconciler) setFinallyStartedTimeIfNeeded(pr *v1.PipelineRun, facts *re
 	}
 }
 
-func (c *Reconciler) createTaskRuns(ctx context.Context, rpt *resources.ResolvedPipelineTask, pr *v1.PipelineRun) ([]*v1.TaskRun, error) {
+func (c *Reconciler) createTaskRuns(ctx context.Context, rpt *resources.ResolvedPipelineTask, pr *v1.PipelineRun, facts *resources.PipelineRunFacts) ([]*v1.TaskRun, error) {
 	ctx, span := c.tracerProvider.Tracer(TracerName).Start(ctx, "createTaskRuns")
 	defer span.End()
 	var taskRuns []*v1.TaskRun
@@ -821,7 +873,7 @@ func (c *Reconciler) createTaskRuns(ctx context.Context, rpt *resources.Resolved
 		if len(matrixCombinations) > i {
 			params = matrixCombinations[i]
 		}
-		taskRun, err := c.createTaskRun(ctx, taskRunName, params, rpt, pr)
+		taskRun, err := c.createTaskRun(ctx, taskRunName, params, rpt, pr, facts)
 		if err != nil {
 			err := c.handleRunCreationError(ctx, pr, err)
 			return nil, err
@@ -831,11 +883,11 @@ func (c *Reconciler) createTaskRuns(ctx context.Context, rpt *resources.Resolved
 	return taskRuns, nil
 }
 
-func (c *Reconciler) createTaskRun(ctx context.Context, taskRunName string, params v1.Params, rpt *resources.ResolvedPipelineTask, pr *v1.PipelineRun) (*v1.TaskRun, error) {
+func (c *Reconciler) createTaskRun(ctx context.Context, taskRunName string, params v1.Params, rpt *resources.ResolvedPipelineTask, pr *v1.PipelineRun, facts *resources.PipelineRunFacts) (*v1.TaskRun, error) {
 	ctx, span := c.tracerProvider.Tracer(TracerName).Start(ctx, "createTaskRun")
 	defer span.End()
 	logger := logging.FromContext(ctx)
-	rpt.PipelineTask = resources.ApplyPipelineTaskContexts(rpt.PipelineTask)
+	rpt.PipelineTask = resources.ApplyPipelineTaskContexts(rpt.PipelineTask, pr.Status, facts)
 	taskRunSpec := pr.GetTaskRunSpec(rpt.PipelineTask.Name)
 	params = append(params, rpt.PipelineTask.Params...)
 	tr := &v1.TaskRun{
@@ -907,7 +959,7 @@ func (c *Reconciler) handleRunCreationError(ctx context.Context, pr *v1.Pipeline
 	return err
 }
 
-func (c *Reconciler) createCustomRuns(ctx context.Context, rpt *resources.ResolvedPipelineTask, pr *v1.PipelineRun) ([]*v1beta1.CustomRun, error) {
+func (c *Reconciler) createCustomRuns(ctx context.Context, rpt *resources.ResolvedPipelineTask, pr *v1.PipelineRun, facts *resources.PipelineRunFacts) ([]*v1beta1.CustomRun, error) {
 	var customRuns []*v1beta1.CustomRun
 	ctx, span := c.tracerProvider.Tracer(TracerName).Start(ctx, "createCustomRuns")
 	defer span.End()
@@ -921,7 +973,7 @@ func (c *Reconciler) createCustomRuns(ctx context.Context, rpt *resources.Resolv
 		if len(matrixCombinations) > i {
 			params = matrixCombinations[i]
 		}
-		customRun, err := c.createCustomRun(ctx, customRunName, params, rpt, pr)
+		customRun, err := c.createCustomRun(ctx, customRunName, params, rpt, pr, facts)
 		if err != nil {
 			err := c.handleRunCreationError(ctx, pr, err)
 			return nil, err
@@ -931,11 +983,11 @@ func (c *Reconciler) createCustomRuns(ctx context.Context, rpt *resources.Resolv
 	return customRuns, nil
 }
 
-func (c *Reconciler) createCustomRun(ctx context.Context, runName string, params v1.Params, rpt *resources.ResolvedPipelineTask, pr *v1.PipelineRun) (*v1beta1.CustomRun, error) {
+func (c *Reconciler) createCustomRun(ctx context.Context, runName string, params v1.Params, rpt *resources.ResolvedPipelineTask, pr *v1.PipelineRun, facts *resources.PipelineRunFacts) (*v1beta1.CustomRun, error) {
 	ctx, span := c.tracerProvider.Tracer(TracerName).Start(ctx, "createCustomRun")
 	defer span.End()
 	logger := logging.FromContext(ctx)
-	rpt.PipelineTask = resources.ApplyPipelineTaskContexts(rpt.PipelineTask)
+	rpt.PipelineTask = resources.ApplyPipelineTaskContexts(rpt.PipelineTask, pr.Status, facts)
 	taskRunSpec := pr.GetTaskRunSpec(rpt.PipelineTask.Name)
 	params = append(params, rpt.PipelineTask.Params...)
 

@@ -28,10 +28,12 @@ weight: 202
   - [Specifying `Retries`](#specifying-retries)
   - [Configuring the failure timeout](#configuring-the-failure-timeout)
   - [Specifying `ServiceAccount` credentials](#specifying-serviceaccount-credentials)
+- [<code>TaskRun</code> status](#taskrun-status)
+  - [The <code>status</code> field](#the-status-field)
 - [Monitoring execution status](#monitoring-execution-status)
-  - [Monitoring `Steps`](#monitoring-steps)
-  - [Steps](#steps)
-  - [Monitoring `Results`](#monitoring-results)
+    - [Monitoring `Steps`](#monitoring-steps)
+    - [Steps](#steps)
+    - [Monitoring `Results`](#monitoring-results)
 - [Cancelling a `TaskRun`](#cancelling-a-taskrun)
 - [Debugging a `TaskRun`](#debugging-a-taskrun)
     - [Breakpoint on Failure](#breakpoint-on-failure)
@@ -771,6 +773,30 @@ will execute with the [`default` service account](https://kubernetes.io/docs/tas
 set for the target [`namespace`](https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/).
 
 For more information, see [`ServiceAccount`](auth.md).
+## `TaskRun` status
+The `status` field defines the observed state of `TaskRun`
+### The `status` field
+- Required:
+  - `status` - The most relevant information about the TaskRun's state. This field includes:
+    - `status.conditions`, which contains the latest observations of the `TaskRun`'s state. [See here](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties) for information on typical status properties. 
+  - `podName` - Name of the pod containing the containers responsible for executing this `task`'s `step`s.
+  - `startTime` - The time at which the `TaskRun` began executing, conforms to [RFC3339](https://tools.ietf.org/html/rfc3339) format.
+  - `completionTime` - The time at which the `TaskRun` finished executing, conforms to [RFC3339](https://tools.ietf.org/html/rfc3339) format.
+  - [`taskSpec`](tasks.md#configuring-a-task) - `TaskSpec` defines the desired state of the `Task` executed via the `TaskRun`.
+
+- Optional:
+  - `results` - List of results written out by the `task`'s containers.
+
+  - `provenance` - Provenance contains metadata about resources used in the `TaskRun` such as the source from where a remote `task` definition was fetched. It carries minimum amount of metadata in `TaskRun` `status` so that `Tekton Chains` can utilize it for provenance, its two subfields are:
+    - `refSource`: the source from where a remote `Task` definition was fetched.
+    - `featureFlags`: Identifies the feature flags used during the `TaskRun`.
+  - `steps` - Contains the `state` of each `step` container.
+  - `retriesStatus` - Contains the history of `TaskRun`'s `status` in case of a retry in order to keep record of failures. No `status` stored within `retriesStatus` will have any `date` within as it is redundant.
+  
+  - [`sidecars`](tasks.md#using-a-sidecar-in-a-task) - This field is a list. The list has one entry per `sidecar` in the manifest. Each entry represents the imageid of the corresponding sidecar.
+  - `spanContext` - Contains tracing span context fields.
+  
+  
 
 ## Monitoring execution status
 
@@ -884,6 +910,9 @@ When you cancel a TaskRun, the running pod associated with that `TaskRun` is del
 means that the logs of the `TaskRun` are not preserved. The deletion of the `TaskRun` pod is necessary
 in order to stop `TaskRun` step containers from running.
 
+**Note: if `keep-pod-on-cancel` is set to
+`"true"` in the `feature-flags`,  the pod associated with that `TaskRun` will not be deleted**
+
 Example of cancelling a `TaskRun`:
 
 ```yaml
@@ -906,7 +935,8 @@ TaskRuns can be halted on failure for troubleshooting by providing the following
 ```yaml
 spec:
   debug:
-    breakpoint: ["onFailure"]
+    breakpoints:
+      onFailure: "enabled"
 ```
 
 Upon failure of a step, the TaskRun Pod execution is halted. If this TaskRun Pod continues to run without any lifecycle
@@ -915,7 +945,7 @@ change done by the user (running the debug-continue or debug-fail-continue scrip
 During this time, the user/client can get remote shell access to the step container with a command such as the following.
 
 ```bash
-kubectl exec -it print-date-d7tj5-pod -c step-print-date-human-readable
+kubectl exec -it print-date-d7tj5-pod -c step-print-date-human-readable sh
 ```
 
 ### Debug Environment

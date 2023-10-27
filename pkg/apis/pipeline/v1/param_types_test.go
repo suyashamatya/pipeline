@@ -152,7 +152,7 @@ func TestParamSpec_SetDefaults(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			tc.before.SetDefaults(ctx)
-			if d := cmp.Diff(tc.before, tc.defaultsApplied); d != "" {
+			if d := cmp.Diff(tc.defaultsApplied, tc.before); d != "" {
 				t.Error(diff.PrintWantGot(d))
 			}
 		})
@@ -649,6 +649,41 @@ func TestExtractDefaultParamArrayLengths(t *testing.T) {
 			got := tc.params.ExtractDefaultParamArrayLengths()
 			if d := cmp.Diff(tc.want, got, cmpopts.EquateEmpty()); d != "" {
 				t.Errorf("wrong default param array lengths: %s", d)
+			}
+		})
+	}
+}
+
+func TestParseTaskandResultName(t *testing.T) {
+	tcs := []struct {
+		name             string
+		param            v1.Param
+		pipelineTaskName string
+		resultName       string
+	}{{
+		name:             "matrix length context var",
+		param:            v1.Param{Name: "foo", Value: v1.ParamValue{StringVal: "$(tasks.matrix-emitting-results.matrix.length)", Type: v1.ParamTypeString}},
+		pipelineTaskName: "matrix-emitting-results",
+	}, {
+		name:             "matrix results length context var",
+		param:            v1.Param{Name: "foo", Value: v1.ParamValue{StringVal: "$(tasks.myTask.matrix.ResultName.length)", Type: v1.ParamTypeString}},
+		pipelineTaskName: "myTask",
+		resultName:       "ResultName",
+	}, {
+		name:             "empty context var",
+		param:            v1.Param{Name: "foo", Value: v1.ParamValue{StringVal: "", Type: v1.ParamTypeString}},
+		pipelineTaskName: "",
+		resultName:       "",
+	}}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			pipelineTaskName, resultName := tc.param.ParseTaskandResultName()
+
+			if d := cmp.Diff(tc.pipelineTaskName, pipelineTaskName); d != "" {
+				t.Errorf(diff.PrintWantGot(d))
+			}
+			if d := cmp.Diff(tc.resultName, resultName); d != "" {
+				t.Errorf(diff.PrintWantGot(d))
 			}
 		})
 	}

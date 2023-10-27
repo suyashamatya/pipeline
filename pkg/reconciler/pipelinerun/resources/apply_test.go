@@ -26,9 +26,13 @@ import (
 	v1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
 	resources "github.com/tektoncd/pipeline/pkg/reconciler/pipelinerun/resources"
+	taskresources "github.com/tektoncd/pipeline/pkg/reconciler/taskrun/resources"
 	"github.com/tektoncd/pipeline/test/diff"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/selection"
+	"knative.dev/pkg/apis"
+	duckv1 "knative.dev/pkg/apis/duck/v1"
 )
 
 func TestApplyParameters(t *testing.T) {
@@ -1705,6 +1709,33 @@ func TestApplyParameters(t *testing.T) {
 					},
 				},
 			},
+		}, {
+			name:   "parameter/s in tasks and finally display name",
+			params: v1.Params{{Name: "second-param", Value: *v1.NewStructuredValues("second-value")}},
+			original: v1.PipelineSpec{
+				Params: []v1.ParamSpec{
+					{Name: "first-param", Type: v1.ParamTypeString, Default: v1.NewStructuredValues("default-value")},
+					{Name: "second-param", Type: v1.ParamTypeString, Default: v1.NewStructuredValues("default-value")},
+				},
+				Tasks: []v1.PipelineTask{{
+					DisplayName: "Human Readable Name $(params.first-param) $(params.second-param)",
+				}},
+				Finally: []v1.PipelineTask{{
+					DisplayName: "Human Readable Name $(params.first-param) $(params.second-param)",
+				}},
+			},
+			expected: v1.PipelineSpec{
+				Params: []v1.ParamSpec{
+					{Name: "first-param", Type: v1.ParamTypeString, Default: v1.NewStructuredValues("default-value")},
+					{Name: "second-param", Type: v1.ParamTypeString, Default: v1.NewStructuredValues("default-value")},
+				},
+				Tasks: []v1.PipelineTask{{
+					DisplayName: "Human Readable Name default-value second-value",
+				}},
+				Finally: []v1.PipelineTask{{
+					DisplayName: "Human Readable Name default-value second-value",
+				}},
+			},
 		},
 	} {
 		tt := tt // capture range variable
@@ -3149,6 +3180,30 @@ func TestApplyTaskResults_EmbeddedExpression(t *testing.T) {
 				},
 			},
 		}},
+	}, {
+		name: "Test result substitution on embedded variable substitution expression - displayName",
+		resolvedResultRefs: resources.ResolvedResultRefs{{
+			Value: *v1.NewStructuredValues("aResultValue"),
+			ResultReference: v1.ResultRef{
+				PipelineTask: "aTask",
+				Result:       "aResult",
+			},
+			FromTaskRun: "aTaskRun",
+		}},
+		targets: resources.PipelineRunState{{
+			PipelineTask: &v1.PipelineTask{
+				Name:        "bTask",
+				TaskRef:     &v1.TaskRef{Name: "bTask"},
+				DisplayName: "Result value --> $(tasks.aTask.results.aResult)",
+			},
+		}},
+		want: resources.PipelineRunState{{
+			PipelineTask: &v1.PipelineTask{
+				Name:        "bTask",
+				TaskRef:     &v1.TaskRef{Name: "bTask"},
+				DisplayName: "Result value --> aResultValue",
+			},
+		}},
 	}} {
 		t.Run(tt.name, func(t *testing.T) {
 			resources.ApplyTaskResults(tt.targets, tt.resolvedResultRefs)
@@ -3161,66 +3216,83 @@ func TestApplyTaskResults_EmbeddedExpression(t *testing.T) {
 
 func TestContext(t *testing.T) {
 	for _, tc := range []struct {
-		description string
-		pr          *v1.PipelineRun
-		original    v1.Param
-		expected    v1.Param
+		description         string
+		pr                  *v1.PipelineRun
+		original            v1.Param
+		expected            v1.Param
+		displayName         string
+		expectedDisplayName string
 	}{{
 		description: "context.pipeline.name defined",
 		pr: &v1.PipelineRun{
 			ObjectMeta: metav1.ObjectMeta{Name: "name"},
 		},
-		original: v1.Param{Value: *v1.NewStructuredValues("$(context.pipeline.name)-1")},
-		expected: v1.Param{Value: *v1.NewStructuredValues("test-pipeline-1")},
+		original:            v1.Param{Value: *v1.NewStructuredValues("$(context.pipeline.name)-1")},
+		expected:            v1.Param{Value: *v1.NewStructuredValues("test-pipeline-1")},
+		displayName:         "$(context.pipeline.name)-1",
+		expectedDisplayName: "test-pipeline-1",
 	}, {
 		description: "context.pipelineRun.name defined",
 		pr: &v1.PipelineRun{
 			ObjectMeta: metav1.ObjectMeta{Name: "name"},
 		},
-		original: v1.Param{Value: *v1.NewStructuredValues("$(context.pipelineRun.name)-1")},
-		expected: v1.Param{Value: *v1.NewStructuredValues("name-1")},
+		original:            v1.Param{Value: *v1.NewStructuredValues("$(context.pipelineRun.name)-1")},
+		expected:            v1.Param{Value: *v1.NewStructuredValues("name-1")},
+		displayName:         "$(context.pipelineRun.name)-1",
+		expectedDisplayName: "name-1",
 	}, {
 		description: "context.pipelineRun.name undefined",
 		pr: &v1.PipelineRun{
 			ObjectMeta: metav1.ObjectMeta{Name: ""},
 		},
-		original: v1.Param{Value: *v1.NewStructuredValues("$(context.pipelineRun.name)-1")},
-		expected: v1.Param{Value: *v1.NewStructuredValues("-1")},
+		original:            v1.Param{Value: *v1.NewStructuredValues("$(context.pipelineRun.name)-1")},
+		expected:            v1.Param{Value: *v1.NewStructuredValues("-1")},
+		displayName:         "$(context.pipelineRun.name)-1",
+		expectedDisplayName: "-1",
 	}, {
 		description: "context.pipelineRun.namespace defined",
 		pr: &v1.PipelineRun{
 			ObjectMeta: metav1.ObjectMeta{Namespace: "namespace"},
 		},
-		original: v1.Param{Value: *v1.NewStructuredValues("$(context.pipelineRun.namespace)-1")},
-		expected: v1.Param{Value: *v1.NewStructuredValues("namespace-1")},
+		original:            v1.Param{Value: *v1.NewStructuredValues("$(context.pipelineRun.namespace)-1")},
+		expected:            v1.Param{Value: *v1.NewStructuredValues("namespace-1")},
+		displayName:         "$(context.pipelineRun.namespace)-1",
+		expectedDisplayName: "namespace-1",
 	}, {
 		description: "context.pipelineRun.namespace undefined",
 		pr: &v1.PipelineRun{
 			ObjectMeta: metav1.ObjectMeta{Namespace: ""},
 		},
-		original: v1.Param{Value: *v1.NewStructuredValues("$(context.pipelineRun.namespace)-1")},
-		expected: v1.Param{Value: *v1.NewStructuredValues("-1")},
+		original:            v1.Param{Value: *v1.NewStructuredValues("$(context.pipelineRun.namespace)-1")},
+		expected:            v1.Param{Value: *v1.NewStructuredValues("-1")},
+		displayName:         "$(context.pipelineRun.namespace)-1",
+		expectedDisplayName: "-1",
 	}, {
 		description: "context.pipelineRun.uid defined",
 		pr: &v1.PipelineRun{
 			ObjectMeta: metav1.ObjectMeta{UID: "UID"},
 		},
-		original: v1.Param{Value: *v1.NewStructuredValues("$(context.pipelineRun.uid)-1")},
-		expected: v1.Param{Value: *v1.NewStructuredValues("UID-1")},
+		original:            v1.Param{Value: *v1.NewStructuredValues("$(context.pipelineRun.uid)-1")},
+		expected:            v1.Param{Value: *v1.NewStructuredValues("UID-1")},
+		displayName:         "$(context.pipelineRun.uid)-1",
+		expectedDisplayName: "UID-1",
 	}, {
 		description: "context.pipelineRun.uid undefined",
 		pr: &v1.PipelineRun{
 			ObjectMeta: metav1.ObjectMeta{UID: ""},
 		},
-		original: v1.Param{Value: *v1.NewStructuredValues("$(context.pipelineRun.uid)-1")},
-		expected: v1.Param{Value: *v1.NewStructuredValues("-1")},
+		original:            v1.Param{Value: *v1.NewStructuredValues("$(context.pipelineRun.uid)-1")},
+		expected:            v1.Param{Value: *v1.NewStructuredValues("-1")},
+		displayName:         "$(context.pipelineRun.uid)-1",
+		expectedDisplayName: "-1",
 	}} {
 		t.Run(tc.description, func(t *testing.T) {
 			orig := &v1.Pipeline{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-pipeline"},
 				Spec: v1.PipelineSpec{
 					Tasks: []v1.PipelineTask{{
-						Params: v1.Params{tc.original},
+						DisplayName: tc.displayName,
+						Params:      v1.Params{tc.original},
 						Matrix: &v1.Matrix{
 							Params: v1.Params{tc.original},
 						}}},
@@ -3233,6 +3305,9 @@ func TestContext(t *testing.T) {
 			if d := cmp.Diff(tc.expected, got.Tasks[0].Matrix.Params[0]); d != "" {
 				t.Errorf(diff.PrintWantGot(d))
 			}
+			if d := cmp.Diff(tc.expectedDisplayName, got.Tasks[0].DisplayName); d != "" {
+				t.Errorf(diff.PrintWantGot(d))
+			}
 		})
 	}
 }
@@ -3241,6 +3316,8 @@ func TestApplyPipelineTaskContexts(t *testing.T) {
 	for _, tc := range []struct {
 		description string
 		pt          v1.PipelineTask
+		prstatus    v1.PipelineRunStatus
+		facts       *resources.PipelineRunFacts
 		want        v1.PipelineTask
 	}{{
 		description: "context retries replacement",
@@ -3324,9 +3401,157 @@ func TestApplyPipelineTaskContexts(t *testing.T) {
 				}},
 			},
 		},
+	}, {
+		description: "matrix length context variable",
+		pt: v1.PipelineTask{
+			Params: v1.Params{{
+				Name:  "matrixlength",
+				Value: *v1.NewStructuredValues("$(tasks.matrixed-task-run.matrix.length)"),
+			}},
+		},
+		prstatus: v1.PipelineRunStatus{
+			PipelineRunStatusFields: v1.PipelineRunStatusFields{
+				PipelineSpec: &v1.PipelineSpec{
+					Tasks: []v1.PipelineTask{{
+						Name: "matrixed-task-run",
+						Matrix: &v1.Matrix{
+							Params: v1.Params{
+								{Name: "platform", Value: *v1.NewStructuredValues("linux", "mac", "windows")},
+								{Name: "browser", Value: *v1.NewStructuredValues("chrome", "firefox", "safari")},
+							}},
+					}},
+				},
+			}},
+		want: v1.PipelineTask{
+			Params: v1.Params{{
+				Name:  "matrixlength",
+				Value: *v1.NewStructuredValues("9"),
+			}},
+		},
+	}, {
+		description: "matrix length and matrix results length context variables in matrix include params ",
+		pt: v1.PipelineTask{
+			DisplayName: "A task created $(tasks.matrix-emitting-results.matrix.length) instances and each produced $(tasks.matrix-emitting-results.matrix.IMAGE-DIGEST.length) results",
+			Params: v1.Params{{
+				Name:  "matrixlength",
+				Value: *v1.NewStructuredValues("$(tasks.matrix-emitting-results.matrix.length)"),
+			}, {
+				Name:  "matrixresultslength",
+				Value: *v1.NewStructuredValues("$(tasks.matrix-emitting-results.matrix.IMAGE-DIGEST.length)"),
+			}},
+		},
+		prstatus: v1.PipelineRunStatus{
+			PipelineRunStatusFields: v1.PipelineRunStatusFields{
+				PipelineSpec: &v1.PipelineSpec{
+					Tasks: []v1.PipelineTask{{
+						Name: "matrix-emitting-results",
+						TaskSpec: &v1.EmbeddedTask{
+							TaskSpec: v1.TaskSpec{
+								Params: []v1.ParamSpec{{
+									Name: "IMAGE",
+									Type: v1.ParamTypeString,
+								}, {
+									Name: "DIGEST",
+									Type: v1.ParamTypeString,
+								}},
+								Results: []v1.TaskResult{{
+									Name: "IMAGE-DIGEST",
+								}},
+								Steps: []v1.Step{{
+									Name:   "produce-results",
+									Image:  "bash:latest",
+									Script: `#!/usr/bin/env bash\necho -n "$(params.DIGEST)" | sha256sum | tee $(results.IMAGE-DIGEST.path)"`,
+								}},
+							},
+						},
+						Matrix: &v1.Matrix{
+							Include: []v1.IncludeParams{{
+								Name: "build-1",
+								Params: v1.Params{{
+									Name: "DOCKERFILE", Value: *v1.NewStructuredValues("path/to/Dockerfile1"),
+								}, {
+									Name: "IMAGE", Value: *v1.NewStructuredValues("image-1"),
+								}},
+							}, {
+								Name: "build-2",
+								Params: v1.Params{{
+									Name: "DOCKERFILE", Value: *v1.NewStructuredValues("path/to/Dockerfile2"),
+								}, {
+									Name: "IMAGE", Value: *v1.NewStructuredValues("image-2"),
+								}},
+							}, {
+								Name: "build-3",
+								Params: v1.Params{{
+									Name: "DOCKERFILE", Value: *v1.NewStructuredValues("path/to/Dockerfile3"),
+								}, {
+									Name: "IMAGE", Value: *v1.NewStructuredValues("image-3"),
+								}},
+							}},
+						}},
+					},
+				},
+			},
+		},
+		facts: &resources.PipelineRunFacts{
+			State: resources.PipelineRunState{{
+				PipelineTask: &v1.PipelineTask{
+					Name: "matrix-emitting-results",
+				},
+				TaskRunNames: []string{"matrix-emitting-results-0"},
+				TaskRuns: []*v1.TaskRun{{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "matrix-emitting-results-0",
+					},
+					Status: v1.TaskRunStatus{
+						TaskRunStatusFields: v1.TaskRunStatusFields{
+							Results: []v1.TaskRunResult{{
+								Name:  "IMAGE-DIGEST",
+								Value: *v1.NewStructuredValues("123"),
+							}},
+						},
+					},
+				}, {
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "matrix-emitting-results-1",
+					},
+					Status: v1.TaskRunStatus{
+						TaskRunStatusFields: v1.TaskRunStatusFields{
+							Results: []v1.TaskRunResult{{
+								Name:  "IMAGE-DIGEST",
+								Value: *v1.NewStructuredValues("456"),
+							}},
+						},
+					},
+				}, {
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "matrix-emitting-results-2",
+					},
+					Status: v1.TaskRunStatus{
+						TaskRunStatusFields: v1.TaskRunStatusFields{
+							Results: []v1.TaskRunResult{{
+								Name:  "IMAGE-DIGEST",
+								Value: *v1.NewStructuredValues("789"),
+							}},
+						},
+					},
+				},
+				},
+				ResultsCache: map[string][]string{},
+			}},
+		},
+		want: v1.PipelineTask{
+			DisplayName: "A task created 3 instances and each produced 3 results",
+			Params: v1.Params{{
+				Name:  "matrixlength",
+				Value: *v1.NewStructuredValues("3"),
+			}, {
+				Name:  "matrixresultslength",
+				Value: *v1.NewStructuredValues("3"),
+			}},
+		},
 	}} {
 		t.Run(tc.description, func(t *testing.T) {
-			got := resources.ApplyPipelineTaskContexts(&tc.pt)
+			got := resources.ApplyPipelineTaskContexts(&tc.pt, tc.prstatus, tc.facts)
 			if d := cmp.Diff(&tc.want, got); d != "" {
 				t.Errorf(diff.PrintWantGot(d))
 			}
@@ -4064,8 +4289,9 @@ func TestApplyTaskRunContext(t *testing.T) {
 	}
 	state := resources.PipelineRunState{{
 		PipelineTask: &v1.PipelineTask{
-			Name:    "task4",
-			TaskRef: &v1.TaskRef{Name: "task"},
+			Name:        "task4",
+			DisplayName: "Task 1 $(tasks.task1.status) but Task 3 exited with $(tasks.task3.status)",
+			TaskRef:     &v1.TaskRef{Name: "task"},
 			Params: v1.Params{{
 				Name:  "task1",
 				Value: *v1.NewStructuredValues("$(tasks.task1.status)"),
@@ -4082,8 +4308,9 @@ func TestApplyTaskRunContext(t *testing.T) {
 	}}
 	expectedState := resources.PipelineRunState{{
 		PipelineTask: &v1.PipelineTask{
-			Name:    "task4",
-			TaskRef: &v1.TaskRef{Name: "task"},
+			Name:        "task4",
+			DisplayName: "Task 1 succeeded but Task 3 exited with none",
+			TaskRef:     &v1.TaskRef{Name: "task"},
 			Params: v1.Params{{
 				Name:  "task1",
 				Value: *v1.NewStructuredValues("succeeded"),
@@ -4101,5 +4328,321 @@ func TestApplyTaskRunContext(t *testing.T) {
 	resources.ApplyPipelineTaskStateContext(state, r)
 	if d := cmp.Diff(expectedState, state); d != "" {
 		t.Fatalf("ApplyTaskRunContext() %s", diff.PrintWantGot(d))
+	}
+}
+
+func TestPropagateResults(t *testing.T) {
+	for _, tt := range []struct {
+		name                 string
+		resolvedTask         *resources.ResolvedPipelineTask
+		runStates            resources.PipelineRunState
+		expectedResolvedTask *resources.ResolvedPipelineTask
+	}{
+		{
+			name: "propagate string result",
+			resolvedTask: &resources.ResolvedPipelineTask{
+				ResolvedTask: &taskresources.ResolvedTask{
+					TaskSpec: &v1.TaskSpec{
+						Steps: []v1.Step{
+							{
+								Name:    "$(tasks.pt1.results.r1)",
+								Command: []string{"$(tasks.pt1.results.r2)"},
+								Args:    []string{"$(tasks.pt2.results.r1)"},
+							},
+						},
+					},
+				},
+			},
+			runStates: resources.PipelineRunState{
+				{
+					PipelineTask: &v1.PipelineTask{
+						Name: "pt1",
+					},
+					TaskRuns: []*v1.TaskRun{
+						{
+							Status: v1.TaskRunStatus{
+								Status: duckv1.Status{
+									Conditions: duckv1.Conditions{
+										{
+											Type:   apis.ConditionSucceeded,
+											Status: corev1.ConditionTrue,
+										},
+									},
+								},
+								TaskRunStatusFields: v1.TaskRunStatusFields{
+									Results: []v1.TaskRunResult{
+										{
+											Name: "r1",
+											Type: v1.ResultsTypeString,
+											Value: v1.ResultValue{
+												StringVal: "step1",
+											},
+										},
+										{
+											Name: "r2",
+											Type: v1.ResultsTypeString,
+											Value: v1.ResultValue{
+												StringVal: "echo",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				}, {
+					PipelineTask: &v1.PipelineTask{
+						Name: "pt2",
+					},
+					TaskRuns: []*v1.TaskRun{
+						{
+							Status: v1.TaskRunStatus{
+								Status: duckv1.Status{
+									Conditions: duckv1.Conditions{
+										{
+											Type:   apis.ConditionSucceeded,
+											Status: corev1.ConditionTrue,
+										},
+									},
+								},
+								TaskRunStatusFields: v1.TaskRunStatusFields{
+									Results: []v1.TaskRunResult{
+										{
+											Name: "r1",
+											Type: v1.ResultsTypeString,
+											Value: v1.ResultValue{
+												StringVal: "arg1",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedResolvedTask: &resources.ResolvedPipelineTask{
+				ResolvedTask: &taskresources.ResolvedTask{
+					TaskSpec: &v1.TaskSpec{
+						Steps: []v1.Step{
+							{
+								Name:    "step1",
+								Command: []string{"echo"},
+								Args:    []string{"arg1"},
+							},
+						},
+					},
+				},
+			},
+		}, {
+			name: "propagate array result",
+			resolvedTask: &resources.ResolvedPipelineTask{
+				ResolvedTask: &taskresources.ResolvedTask{
+					TaskSpec: &v1.TaskSpec{
+						Steps: []v1.Step{
+							{
+								Command: []string{"$(tasks.pt1.results.r1[*])"},
+								Args:    []string{"$(tasks.pt2.results.r1[*])"},
+							},
+						},
+					},
+				},
+			},
+			runStates: resources.PipelineRunState{
+				{
+					PipelineTask: &v1.PipelineTask{
+						Name: "pt1",
+					},
+					TaskRuns: []*v1.TaskRun{
+						{
+							Status: v1.TaskRunStatus{
+								Status: duckv1.Status{
+									Conditions: duckv1.Conditions{
+										{
+											Type:   apis.ConditionSucceeded,
+											Status: corev1.ConditionTrue,
+										},
+									},
+								},
+								TaskRunStatusFields: v1.TaskRunStatusFields{
+									Results: []v1.TaskRunResult{
+										{
+											Name: "r1",
+											Type: v1.ResultsTypeArray,
+											Value: v1.ResultValue{
+												ArrayVal: []string{"bash", "-c"},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				}, {
+					PipelineTask: &v1.PipelineTask{
+						Name: "pt2",
+					},
+					TaskRuns: []*v1.TaskRun{
+						{
+							Status: v1.TaskRunStatus{
+								Status: duckv1.Status{
+									Conditions: duckv1.Conditions{
+										{
+											Type:   apis.ConditionSucceeded,
+											Status: corev1.ConditionTrue,
+										},
+									},
+								},
+								TaskRunStatusFields: v1.TaskRunStatusFields{
+									Results: []v1.TaskRunResult{
+										{
+											Name: "r1",
+											Type: v1.ResultsTypeArray,
+											Value: v1.ResultValue{
+												ArrayVal: []string{"echo", "arg1"},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedResolvedTask: &resources.ResolvedPipelineTask{
+				ResolvedTask: &taskresources.ResolvedTask{
+					TaskSpec: &v1.TaskSpec{
+						Steps: []v1.Step{
+							{
+								Command: []string{"bash", "-c"},
+								Args:    []string{"echo", "arg1"},
+							},
+						},
+					},
+				},
+			},
+		}, {
+			name: "propagate object result",
+			resolvedTask: &resources.ResolvedPipelineTask{
+				ResolvedTask: &taskresources.ResolvedTask{
+					TaskSpec: &v1.TaskSpec{
+						Steps: []v1.Step{
+							{
+								Command: []string{"$(tasks.pt1.results.r1.command1)", "$(tasks.pt1.results.r1.command2)"},
+								Args:    []string{"$(tasks.pt2.results.r1.arg1)", "$(tasks.pt2.results.r1.arg2)"},
+							},
+						},
+					},
+				},
+			},
+			runStates: resources.PipelineRunState{
+				{
+					PipelineTask: &v1.PipelineTask{
+						Name: "pt1",
+					},
+					TaskRuns: []*v1.TaskRun{
+						{
+							Status: v1.TaskRunStatus{
+								Status: duckv1.Status{
+									Conditions: duckv1.Conditions{
+										{
+											Type:   apis.ConditionSucceeded,
+											Status: corev1.ConditionTrue,
+										},
+									},
+								},
+								TaskRunStatusFields: v1.TaskRunStatusFields{
+									Results: []v1.TaskRunResult{
+										{
+											Name: "r1",
+											Type: v1.ResultsTypeObject,
+											Value: v1.ResultValue{
+												ObjectVal: map[string]string{
+													"command1": "bash",
+													"command2": "-c",
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				}, {
+					PipelineTask: &v1.PipelineTask{
+						Name: "pt2",
+					},
+					TaskRuns: []*v1.TaskRun{
+						{
+							Status: v1.TaskRunStatus{
+								Status: duckv1.Status{
+									Conditions: duckv1.Conditions{
+										{
+											Type:   apis.ConditionSucceeded,
+											Status: corev1.ConditionTrue,
+										},
+									},
+								},
+								TaskRunStatusFields: v1.TaskRunStatusFields{
+									Results: []v1.TaskRunResult{
+										{
+											Name: "r1",
+											Type: v1.ResultsTypeObject,
+											Value: v1.ResultValue{
+												ObjectVal: map[string]string{
+													"arg1": "echo",
+													"arg2": "arg1",
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedResolvedTask: &resources.ResolvedPipelineTask{
+				ResolvedTask: &taskresources.ResolvedTask{
+					TaskSpec: &v1.TaskSpec{
+						Steps: []v1.Step{
+							{
+								Command: []string{"bash", "-c"},
+								Args:    []string{"echo", "arg1"},
+							},
+						},
+					},
+				},
+			},
+		}, {
+			name: "not propagate result when resolved task is nil",
+			resolvedTask: &resources.ResolvedPipelineTask{
+				ResolvedTask: nil,
+			},
+			runStates: resources.PipelineRunState{},
+			expectedResolvedTask: &resources.ResolvedPipelineTask{
+				ResolvedTask: nil,
+			},
+		}, {
+			name: "not propagate result when taskSpec is nil",
+			resolvedTask: &resources.ResolvedPipelineTask{
+				ResolvedTask: &taskresources.ResolvedTask{
+					TaskSpec: nil,
+				},
+			},
+			runStates: resources.PipelineRunState{},
+			expectedResolvedTask: &resources.ResolvedPipelineTask{
+				ResolvedTask: &taskresources.ResolvedTask{
+					TaskSpec: nil,
+				},
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			resources.PropagateResults(tt.resolvedTask, tt.runStates)
+			if d := cmp.Diff(tt.expectedResolvedTask, tt.resolvedTask); d != "" {
+				t.Fatalf("PropagateResults() %s", diff.PrintWantGot(d))
+			}
+		})
 	}
 }

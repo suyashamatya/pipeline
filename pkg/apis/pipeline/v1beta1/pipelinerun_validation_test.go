@@ -1159,7 +1159,7 @@ func TestPipelineRunSpec_Invalidate(t *testing.T) {
 		),
 		withContext: cfgtesting.EnableAlphaAPIFields,
 	}, {
-		name: "computeResources disallowed without alpha feature gate",
+		name: "computeResources disallowed without beta feature gate",
 		spec: v1beta1.PipelineRunSpec{
 			PipelineRef: &v1beta1.PipelineRef{Name: "foo"},
 			TaskRunSpecs: []v1beta1.PipelineTaskRunSpec{
@@ -1172,7 +1172,7 @@ func TestPipelineRunSpec_Invalidate(t *testing.T) {
 			},
 		},
 		withContext: cfgtesting.EnableStableAPIFields,
-		wantErr:     apis.ErrGeneric("computeResources requires \"enable-api-fields\" feature gate to be \"alpha\" but it is \"stable\"").ViaIndex(0).ViaField("taskRunSpecs"),
+		wantErr:     apis.ErrGeneric("computeResources requires \"enable-api-fields\" feature gate to be \"alpha\" or \"beta\" but it is \"stable\"").ViaIndex(0).ViaField("taskRunSpecs"),
 	}}
 
 	for _, ps := range tests {
@@ -1208,6 +1208,18 @@ func TestPipelineRunSpec_Validate(t *testing.T) {
 		},
 	}, {
 		name: "valid task-level (taskRunSpecs.resources) resource requirements configured",
+		spec: v1beta1.PipelineRunSpec{
+			PipelineRef: &v1beta1.PipelineRef{Name: "pipeline"},
+			TaskRunSpecs: []v1beta1.PipelineTaskRunSpec{{
+				PipelineTaskName: "pipelineTask",
+				ComputeResources: &corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceMemory: corev1resources.MustParse("2Gi")},
+				},
+			}},
+		},
+		withContext: cfgtesting.EnableBetaAPIFields,
+	}, {
+		name: "valid task-level (taskRunSpecs.resources) resource requirements configured with stepOverride",
 		spec: v1beta1.PipelineRunSpec{
 			PipelineRef: &v1beta1.PipelineRef{Name: "pipeline"},
 			TaskRunSpecs: []v1beta1.PipelineTaskRunSpec{{
@@ -1453,7 +1465,7 @@ func TestPipelineRun_InvalidTimeouts(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			err := tc.pr.Validate(ctx)
-			if d := cmp.Diff(err.Error(), tc.want.Error()); d != "" {
+			if d := cmp.Diff(tc.want.Error(), err.Error()); d != "" {
 				t.Error(diff.PrintWantGot(d))
 			}
 		})
@@ -1541,6 +1553,211 @@ func TestPipelineRunWithTimeout_Validate(t *testing.T) {
 			}
 			if err := ts.pr.Validate(ctx); err != nil {
 				t.Error(err)
+			}
+		})
+	}
+}
+
+// TestPipelineRunSpecBetaFeatures tests the beta API-driven features
+// of PipelineRunSpec are correctly governed `enable-api-fields`, which
+// must be set to "alpha" or "beta".
+func TestPipelineRunSpecBetaFeatures(t *testing.T) {
+	tts := []struct {
+		name string
+		spec v1beta1.PipelineSpec
+	}{{
+		name: "array indexing in Tasks",
+		spec: v1beta1.PipelineSpec{
+			Params: []v1beta1.ParamSpec{
+				{Name: "first-param", Type: v1beta1.ParamTypeArray, Default: v1beta1.NewStructuredValues("default-value", "default-value-again")},
+			},
+			Tasks: []v1beta1.PipelineTask{{
+				Name: "foo",
+				Params: v1beta1.Params{
+					{Name: "first-task-first-param", Value: *v1beta1.NewStructuredValues("$(params.first-param[0])")},
+				},
+				TaskRef: &v1beta1.TaskRef{Name: "foo"},
+			}},
+		},
+	}, {
+		name: "array indexing in Finally",
+		spec: v1beta1.PipelineSpec{
+			Params: []v1beta1.ParamSpec{
+				{Name: "first-param", Type: v1beta1.ParamTypeArray, Default: v1beta1.NewStructuredValues("default-value", "default-value-again")},
+			},
+			Tasks: []v1beta1.PipelineTask{{
+				Name:    "foo",
+				TaskRef: &v1beta1.TaskRef{Name: "foo"},
+			}},
+			Finally: []v1beta1.PipelineTask{{
+				Name: "bar",
+				Params: v1beta1.Params{
+					{Name: "first-task-first-param", Value: *v1beta1.NewStructuredValues("$(params.first-param[0])")},
+				},
+				TaskRef: &v1beta1.TaskRef{Name: "bar"},
+			}},
+		},
+	}, {
+		name: "pipeline tasks - use of resolver",
+		spec: v1beta1.PipelineSpec{
+			Tasks: []v1beta1.PipelineTask{{
+				Name:    "uses-resolver",
+				TaskRef: &v1beta1.TaskRef{ResolverRef: v1beta1.ResolverRef{Resolver: "bar"}},
+			}},
+		},
+	}, {
+		name: "pipeline tasks - use of resolver params",
+		spec: v1beta1.PipelineSpec{
+			Tasks: []v1beta1.PipelineTask{{
+				Name:    "uses-resolver-params",
+				TaskRef: &v1beta1.TaskRef{ResolverRef: v1beta1.ResolverRef{Resolver: "bar", Params: v1beta1.Params{{}}}},
+			}},
+		},
+	}, {
+		name: "finally tasks - use of resolver",
+		spec: v1beta1.PipelineSpec{
+			Tasks: []v1beta1.PipelineTask{{
+				Name:    "valid-pipeline-task",
+				TaskRef: &v1beta1.TaskRef{Name: "foo-task"},
+			}},
+			Finally: []v1beta1.PipelineTask{{
+				Name:    "uses-resolver",
+				TaskRef: &v1beta1.TaskRef{ResolverRef: v1beta1.ResolverRef{Resolver: "bar"}},
+			}},
+		},
+	}, {
+		name: "finally tasks - use of resolver params",
+		spec: v1beta1.PipelineSpec{
+			Tasks: []v1beta1.PipelineTask{{
+				Name:    "valid-pipeline-task",
+				TaskRef: &v1beta1.TaskRef{Name: "foo-task"},
+			}},
+			Finally: []v1beta1.PipelineTask{{
+				Name:    "uses-resolver-params",
+				TaskRef: &v1beta1.TaskRef{ResolverRef: v1beta1.ResolverRef{Resolver: "bar", Params: v1beta1.Params{{}}}},
+			}},
+		},
+	}, {
+		name: "object params",
+		spec: v1beta1.PipelineSpec{
+			Params: []v1beta1.ParamSpec{
+				{Name: "first-param", Type: v1beta1.ParamTypeObject, Properties: map[string]v1beta1.PropertySpec{}},
+			},
+			Tasks: []v1beta1.PipelineTask{{
+				Name:    "foo",
+				TaskRef: &v1beta1.TaskRef{Name: "foo"},
+			}},
+		},
+	}, {
+		name: "object params in Tasks",
+		spec: v1beta1.PipelineSpec{
+			Tasks: []v1beta1.PipelineTask{{
+				Name: "valid-pipeline-task",
+				TaskSpec: &v1beta1.EmbeddedTask{TaskSpec: v1beta1.TaskSpec{
+					Steps:  []v1beta1.Step{{Image: "busybox", Script: "echo hello"}},
+					Params: []v1beta1.ParamSpec{{Name: "my-object-param", Type: v1beta1.ParamTypeObject, Properties: map[string]v1beta1.PropertySpec{}}},
+				}},
+			}},
+		},
+	}, {
+		name: "object params in Finally",
+		spec: v1beta1.PipelineSpec{
+			Tasks: []v1beta1.PipelineTask{{
+				Name:    "foo",
+				TaskRef: &v1beta1.TaskRef{Name: "foo"},
+			}},
+			Finally: []v1beta1.PipelineTask{{
+				Name: "valid-finally-task",
+				TaskSpec: &v1beta1.EmbeddedTask{TaskSpec: v1beta1.TaskSpec{
+					Steps:  []v1beta1.Step{{Image: "busybox", Script: "echo hello"}},
+					Params: []v1beta1.ParamSpec{{Name: "my-object-param", Type: v1beta1.ParamTypeObject, Properties: map[string]v1beta1.PropertySpec{}}},
+				}},
+			}},
+		},
+	}, {
+		name: "array results",
+		spec: v1beta1.PipelineSpec{
+			Tasks: []v1beta1.PipelineTask{{
+				Name:    "valid-pipeline-task",
+				TaskRef: &v1beta1.TaskRef{Name: "foo-task"},
+			}},
+			Results: []v1beta1.PipelineResult{{Name: "my-array-result", Type: v1beta1.ResultsTypeArray, Value: *v1beta1.NewStructuredValues("$(tasks.valid-pipeline-task.results.foo[*])")}},
+		},
+	}, {
+		name: "array results in Tasks",
+		spec: v1beta1.PipelineSpec{
+			Tasks: []v1beta1.PipelineTask{{
+				Name: "valid-pipeline-task",
+				TaskSpec: &v1beta1.EmbeddedTask{TaskSpec: v1beta1.TaskSpec{
+					Steps:   []v1beta1.Step{{Image: "busybox", Script: "echo hello"}},
+					Results: []v1beta1.TaskResult{{Name: "my-array-result", Type: v1beta1.ResultsTypeArray}},
+				}},
+			}},
+		},
+	}, {
+		name: "array results in Finally",
+		spec: v1beta1.PipelineSpec{
+			Tasks: []v1beta1.PipelineTask{{
+				Name:    "valid-pipeline-task",
+				TaskRef: &v1beta1.TaskRef{Name: "foo-task"},
+			}},
+			Finally: []v1beta1.PipelineTask{{
+				Name: "valid-finally-task",
+				TaskSpec: &v1beta1.EmbeddedTask{TaskSpec: v1beta1.TaskSpec{
+					Steps:   []v1beta1.Step{{Image: "busybox", Script: "echo hello"}},
+					Results: []v1beta1.TaskResult{{Name: "my-array-result", Type: v1beta1.ResultsTypeArray}},
+				}},
+			}},
+		},
+	}, {
+		name: "object results",
+		spec: v1beta1.PipelineSpec{
+			Tasks: []v1beta1.PipelineTask{{
+				Name:    "valid-pipeline-task",
+				TaskRef: &v1beta1.TaskRef{Name: "foo-task"},
+			}},
+			Results: []v1beta1.PipelineResult{{Name: "my-object-result", Type: v1beta1.ResultsTypeObject, Value: *v1beta1.NewStructuredValues("$(tasks.valid-pipeline-task.results.foo[*])")}},
+		},
+	}, {
+		name: "object results in Tasks",
+		spec: v1beta1.PipelineSpec{
+			Tasks: []v1beta1.PipelineTask{{
+				Name: "valid-pipeline-task",
+				TaskSpec: &v1beta1.EmbeddedTask{TaskSpec: v1beta1.TaskSpec{
+					Steps:   []v1beta1.Step{{Image: "busybox", Script: "echo hello"}},
+					Results: []v1beta1.TaskResult{{Name: "my-object-result", Type: v1beta1.ResultsTypeObject, Properties: map[string]v1beta1.PropertySpec{}}},
+				}},
+			}},
+		},
+	}, {
+		name: "object results in Finally",
+		spec: v1beta1.PipelineSpec{
+			Tasks: []v1beta1.PipelineTask{{
+				Name:    "valid-pipeline-task",
+				TaskRef: &v1beta1.TaskRef{Name: "foo-task"},
+			}},
+			Finally: []v1beta1.PipelineTask{{
+				Name: "valid-finally-task",
+				TaskSpec: &v1beta1.EmbeddedTask{TaskSpec: v1beta1.TaskSpec{
+					Steps:   []v1beta1.Step{{Image: "busybox", Script: "echo hello"}},
+					Results: []v1beta1.TaskResult{{Name: "my-object-result", Type: v1beta1.ResultsTypeObject, Properties: map[string]v1beta1.PropertySpec{}}},
+				}},
+			}},
+		},
+	}}
+	for _, tt := range tts {
+		t.Run(tt.name, func(t *testing.T) {
+			pr := v1beta1.PipelineRun{ObjectMeta: metav1.ObjectMeta{Name: "foo"}, Spec: v1beta1.PipelineRunSpec{
+				PipelineSpec: &tt.spec,
+			}}
+			ctx := cfgtesting.EnableStableAPIFields(context.Background())
+			if err := pr.Validate(ctx); err == nil {
+				t.Errorf("no error when using beta field when `enable-api-fields` is stable")
+			}
+
+			ctx = cfgtesting.EnableBetaAPIFields(context.Background())
+			if err := pr.Validate(ctx); err != nil {
+				t.Errorf("unexpected error when using beta field: %s", err)
 			}
 		})
 	}

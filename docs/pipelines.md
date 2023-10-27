@@ -13,6 +13,7 @@ weight: 203
   - [Specifying `Workspaces`](#specifying-workspaces)
   - [Specifying `Parameters`](#specifying-parameters)
   - [Adding `Tasks` to the `Pipeline`](#adding-tasks-to-the-pipeline)
+    - [Specifying Display Name](#specifying-displayname-in-pipelinetasks)
     - [Specifying Remote Tasks](#specifying-remote-tasks)
     - [Specifying `Pipelines` in `PipelineTasks`](#specifying-pipelines-in-pipelinetasks)
     - [Specifying `Parameters` in `PipelineTasks`](#specifying-parameters-in-pipelinetasks)
@@ -21,6 +22,8 @@ weight: 203
     - [Tekton Bundles](#tekton-bundles)
     - [Using the `runAfter` field](#using-the-runafter-field)
     - [Using the `retries` field](#using-the-retries-field)
+    - [Using the `onError` field](#using-the-onerror-field)
+    - [Produce results with `OnError`](#produce-results-with-onerror)
     - [Guard `Task` execution using `when` expressions](#guard-task-execution-using-when-expressions)
       - [Guarding a `Task` and its dependent `Tasks`](#guarding-a-task-and-its-dependent-tasks)
         - [Cascade `when` expressions to the specific dependent `Tasks`](#cascade-when-expressions-to-the-specific-dependent-tasks)
@@ -35,6 +38,7 @@ weight: 203
   - [Configuring the `Task` execution order](#configuring-the-task-execution-order)
   - [Adding a description](#adding-a-description)
   - [Adding `Finally` to the `Pipeline`](#adding-finally-to-the-pipeline)
+    - [Specifying Display Name](#specifying-displayname-in-finally-tasks)
     - [Specifying `Workspaces` in `finally` tasks](#specifying-workspaces-in-finally-tasks)
     - [Specifying `Parameters` in `finally` tasks](#specifying-parameters-in-finally-tasks)
     - [Specifying `matrix` in `finally` tasks](#specifying-matrix-in-finally-tasks)
@@ -88,7 +92,7 @@ A `Pipeline` definition supports the following fields:
   - [`workspaces`](#specifying-workspaces) - Specifies a set of Workspaces that the `Pipeline` requires.
   - [`tasks`](#adding-tasks-to-the-pipeline):
       - [`name`](#adding-tasks-to-the-pipeline) - the name of this `Task` within the context of this `Pipeline`.
-      - [`displayName`](#adding-tasks-to-the-pipeline) - a user-facing name of this `Task` within the context of this `Pipeline`.
+      - [`displayName`](#specifying-displayname-in-pipelinetasks) - a user-facing name of this `Task` within the context of this `Pipeline`.
       - [`description`](#adding-tasks-to-the-pipeline) - a description of this `Task` within the context of this `Pipeline`.
       - [`taskRef`](#adding-tasks-to-the-pipeline) - a reference to a `Task` definition.
       - [`taskSpec`](#adding-tasks-to-the-pipeline) - a specification of a `Task`.
@@ -110,7 +114,7 @@ A `Pipeline` definition supports the following fields:
   - [`finally`](#adding-finally-to-the-pipeline) - Specifies one or more `Tasks` to be executed in parallel after
     all other tasks have completed.
     - [`name`](#adding-finally-to-the-pipeline) - the name of this `Task` within the context of this `Pipeline`.
-    - [`displayName`](#adding-finally-to-the-pipeline) - a user-facing name of this `Task` within the context of this `Pipeline`.
+    - [`displayName`](#specifying-displayname-in-finally-tasks) - a user-facing name of this `Task` within the context of this `Pipeline`.
     - [`description`](#adding-finally-to-the-pipeline) - a description of this `Task` within the context of this `Pipeline`.
     - [`taskRef`](#adding-finally-to-the-pipeline) - a reference to a `Task` definition.
     - [`taskSpec`](#adding-finally-to-the-pipeline) - a specification of a `Task`.
@@ -267,6 +271,13 @@ spec:
         - "bar"
 ```
 
+#### Param enum
+> :seedling: **Specifying `enum` is an [alpha](additional-configs.md#alpha-features) feature.** The `enable-param-enum` feature flag must be set to `"true"` to enable this feature.
+
+> :seedling: This feature is WIP and not yet supported/implemented. Documentation to be completed.
+
+Parameter declarations can include `enum` which is a predefine set of valid values that can be accepted by the `Pipeline`.
+
 ## Adding `Tasks` to the `Pipeline`
 
  Your `Pipeline` definition must reference at least one [`Task`](tasks.md).
@@ -294,6 +305,43 @@ tasks:
 ```
 
 Note that any `task` specified in `taskSpec` will be the same version as the `Pipeline`.
+
+### Specifying `displayName` in `PipelineTasks`
+
+The `displayName` field is an optional field that allows you to add a user-facing name of the `PipelineTask` that can be
+used to populate and distinguish in the dashboard. For example:
+
+```yaml
+spec:
+  tasks:
+    - name: scan
+      displayName: "Code Scan"
+      taskRef:
+        name: sonar-scan
+```
+
+The `displayName` also allows you to parameterize the human-readable name of your choice based on the
+[params](#specifying-parameters), [the task results](#passing-one-tasks-results-into-the-parameters-or-when-expressions-of-another),
+and [the context variables](#context-variables). For example:
+
+```yaml
+spec:
+  params:
+    - name: application
+  tasks:
+    - name: scan
+      displayName: "Code Scan for $(params.application)"
+      taskRef:
+        name: sonar-scan
+    - name: upload-scan-report
+      displayName: "Upload Scan Report $(tasks.scan.results.report)"
+      taskRef:
+        name: upload
+```
+
+Specifying task results in the `displayName` does not introduce an inherent resource dependency among `tasks`. The
+pipeline author is responsible for specifying dependency explicitly either using [runAfter](#using-the-runafter-field)
+or rely on [whenExpressions](#guard-task-execution-using-when-expressions) or [task results in params](#using-results).
 
 ### Specifying Remote Tasks
 
@@ -390,8 +438,8 @@ spec:
 
 ### Specifying `Matrix` in `PipelineTasks`
 
-> :seedling: **`Matrix` is an [alpha](additional-configs.md#alpha-features) feature.**
-> The `enable-api-fields` feature flag must be set to `"alpha"` to specify `Matrix` in a `PipelineTask`.
+> :seedling: **`Matrix` is an [beta](additional-configs.md#beta-features) feature.**
+> The `enable-api-fields` feature flag can be set to `"beta"` to specify `Matrix` in a `PipelineTask`.
 
 You can also provide [`Parameters`](tasks.md#specifying-parameters) through the `matrix` field:
 
@@ -606,6 +654,106 @@ tasks:
       name: build-push
 ```
 
+### Using the `onError` field
+
+> :seedling: **Specifying `onError` in `PipelineTasks` is an [alpha](additional-configs.md#alpha-features) feature.** The `enable-api-fields` feature flag must be set to `"alpha"` to specify `onError`  in a `PipelineTask`.
+
+> :seedling: This feature is in **Preview Only** mode and not yet supported/implemented.
+
+When a `PipelineTask` fails, the rest of the `PipelineTasks` are skipped and the `PipelineRun` is declared a failure. If you would like to
+ignore such `PipelineTask` failure and continue executing the rest of the `PipelineTasks`, you can specify `onError` for such a `PipelineTask`.
+
+`OnError` can be set to `stopAndFail` (default) and `continue`. The failure of a `PipelineTask` with `stopAndFail` would stop and fail the whole `PipelineRun`.  A `PipelineTask` fails with `continue` does not fail the whole `PipelineRun`, and the rest of the `PipelineTask` will continue to execute.
+
+To ignore a `PipelineTask` failure, set `onError` to `continue`:
+
+``` yaml
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: demo
+spec:
+  tasks:
+    - name: task1
+      onError: continue
+      taskSpec:
+        steps:
+          - name: step1
+            image: alpine
+            script: |
+              exit 1
+```
+
+At runtime, the failure is ignored to determine the `PipelineRun` status. The `PipelineRun` `message` contains the ignored failure info:
+
+``` yaml
+status:
+  conditions:
+  - lastTransitionTime: "2023-09-28T19:08:30Z"
+    message: 'Tasks Completed: 1 (Failed: 1 (Ignored: 1), Cancelled 0), Skipped: 0'
+    reason: Succeeded
+    status: "True"
+    type: Succeeded
+  ...
+```
+
+Note that the `TaskRun` status remains as it is irrelevant to `OnError`. Failed but ignored `TaskRuns` result in a `failed` status with reason
+`FailureIgnored`.
+
+For example, the `TaskRun` created by the above `PipelineRun` has the following status:
+
+``` bash
+$ kubectl get tr demo-run-task1
+NAME                                SUCCEEDED   REASON           STARTTIME   COMPLETIONTIME
+demo-run-task1                      False       FailureIgnored   12m         12m
+```
+
+To specify `onError` for a `step`, please see [specifying onError for a step](./tasks.md#specifying-onerror-for-a-step).
+
+**Note:** Setting [`Retry`](#specifying-retries) and `OnError:continue` at the same time is **NOT** allowed.
+
+### Produce results with `OnError`
+
+When a `PipelineTask` is set to ignore error and the `PipelineTask` is able to initialize a result before failing, the result is made available to the consumer `PipelineTasks`.
+
+``` yaml
+  tasks:
+    - name: task1
+      onError: continue
+      taskSpec:
+        results:
+          - name: result1
+        steps:
+          - name: step1
+            image: alpine
+            script: |
+              echo -n 123 | tee $(results.result1.path)
+              exit 1
+```
+
+The consumer `PipelineTasks` can access the result by referencing `$(tasks.task1.results.result1)`.
+
+If the result is **NOT** initialized before failing, and there is a `PipelineTask` consuming it:
+
+``` yaml
+  tasks:
+    - name: task1
+      onError: continue
+      taskSpec:
+        results:
+          - name: result1
+        steps:
+          - name: step1
+            image: alpine
+            script: |
+              exit 1
+              echo -n 123 | tee $(results.result1.path)
+```
+
+- If the consuming `PipelineTask` has `OnError:stopAndFail`, the `PipelineRun` will fail with `InvalidTaskResultReference`.
+- If the consuming `PipelineTask` has `OnError:continue`, the consuming `PipelineTask` will be skipped with reason `Results were missing`,
+and the `PipelineRun` will continue to execute.
+
 ### Guard `Task` execution using `when` expressions
 
 To run a `Task` only when certain conditions are met, it is possible to _guard_ task execution using the `when` field. The `when` field allows you to list a series of references to `when` expressions.
@@ -672,6 +820,86 @@ There are a lot of scenarios where `when` expressions can be really useful. Some
 - Checking if an image exists in the registry
 - Checking if the name of a CI job matches
 - Checking if an optional Workspace has been provided
+
+#### Use CEL expression in WhenExpression
+
+> :seedling: **`CEL in WhenExpression` is an [alpha](additional-configs.md#alpha-features) feature.**
+> The `enable-cel-in-whenexpression` feature flag must be set to `"true"` to enable the use of `CEL` in `WhenExpression`.
+
+CEL (Common Expression Language) is a declarative language designed for simplicity, speed, safety, and portability which can be used to express a wide variety of conditions and computations.
+
+You can define a CEL expression in `WhenExpression` to guard the execution of a `Task`.  The CEL expression must evaluate to either `true` or `false`. You can use a single line of CEL string to replace current `WhenExpressions`'s `input`+`operator`+`values`. For example:
+
+```yaml
+# current WhenExpressions
+when:
+  - input: "foo"
+    operator: "in"
+    values: ["foo", "bar"]
+  - input: "duh"
+    operator: "notin"
+    values: ["foo", "bar"]
+
+# with cel
+when:
+  - cel: "'foo' in ['foo', 'bar']"
+  - cel: "!('duh' in ['foo', 'bar'])"
+```
+
+CEL can offer more conditional functions, such as numeric comparisons (e.g. `>`, `<=`, etc), logic operators (e.g. `OR`, `AND`), Regex Pattern Matching. For example:
+
+```yaml
+  when:
+    # test coverage result is larger than 90%
+    - cel: "'$(tasks.unit-test.results.test-coverage)' > 0.9"
+    # params is not empty, or params2 is 8.5 or 8.6
+    - cel: "'$(params.param1)' != '' || '$(params.param2)' == '8.5' || '$(params.param2)' == '8.6'"
+    # param branch matches pattern `release/.*`
+    - cel: "'$(params.branch)'.matches('release/.*')"
+```
+
+##### Variable substitution in CEL
+
+`CEL` supports [string substitutions](https://github.com/tektoncd/pipeline/blob/main/docs/variables.md#variables-available-in-a-pipeline), you can reference string, array indexing or object value of a param/result. For example:
+
+```yaml
+  when:
+    # string result
+    - cel: "$(tasks.unit-test.results.test-coverage) > 0.9"
+    # array indexing result
+    - cel: "$(tasks.unit-test.results.test-coverage[0]) > 0.9"
+    # object result key
+    - cel: "'$(tasks.objectTask.results.repo.url)'.matches('github.com/tektoncd/.*')"
+    # string param
+    - cel: "'$(params.foo)' == 'foo'"
+    # array indexing
+    - cel: "'$(params.branch[0])' == 'foo'"
+    # object param key
+    - cel: "'$(params.repo.url)'.matches('github.com/tektoncd/.*')"
+```
+
+**Note:** the reference needs to be wrapped with single quotes.
+Whole `Array` and `Object` replacements are not supported yet. The following usage is not supported:
+
+```yaml
+  when:
+    - cel: "'foo' in '$(params.array_params[*]']"
+    - cel: "'foo' in '$(params.object_params[*]']"
+```
+
+In addition to the cases listed above, you can craft any valid CEL expression as defined by the [cel-spec language definition](https://github.com/google/cel-spec/blob/master/doc/langdef.md)
+
+
+`CEL` expression is validated at admission webhook and a validation error will be returned if the expression is invalid.
+
+**Note:** To use Tekton's [variable substitution](variables.md), you need to wrap the reference with single quotes. This also means that if you pass another CEL expression via `params` or `results`, it won't be executed. Therefore CEL injection is disallowed.
+
+For example:
+```
+This is valid: '$(params.foo)' == 'foo'
+This is invalid: $(params.foo) == 'foo'
+CEL's variable substitution is not supported yet and thus invalid: params.foo == 'foo'
+```
 
 #### Guarding a `Task` and its dependent `Tasks`
 
@@ -1202,6 +1430,29 @@ spec:
         name: cleanup
 ```
 
+### Specifying `displayName` in `finally` tasks
+
+Similar to [specifying `displayName` in `pipelineTasks`](#specifying-displayname-in-pipelinetasks), `finally` tasks also
+allows to add a user-facing name of the `finally` task that can be used to populate and distinguish in the dashboard.
+For example:
+
+```yaml
+spec:
+  finally:
+    - name: notification
+      displayName: "Notify"
+      taskRef:
+        name: notification
+    - name: notification-using-context-variable
+      displayName: "Notification from $(context.pipeline.name)"
+      taskRef:
+        name: notification
+```
+
+The `displayName` also allows you to parameterize the human-readable name of your choice based on the
+[params](#specifying-parameters), [the task results](#consuming-task-execution-results-in-finally),
+and [the context variables](#context-variables).
+
 ### Specifying `Workspaces` in `finally` tasks
 
 `finally` tasks can specify [workspaces](workspaces.md) which `PipelineTasks` might have utilized
@@ -1249,8 +1500,8 @@ spec:
 
 ### Specifying `matrix` in `finally` tasks
 
-> :seedling: **`Matrix` is an [alpha](additional-configs.md#alpha-features) feature.**
-> The `enable-api-fields` feature flag must be set to `"alpha"` to specify `Matrix` in a `PipelineTask`.
+> :seedling: **`Matrix` is an [beta](additional-configs.md#beta-features) feature.**
+> The `enable-api-fields` feature flag can be set to `"beta"` to specify `Matrix` in a `PipelineTask`.
 
 Similar to `tasks`, you can also provide [`Parameters`](tasks.md#specifying-parameters) through `matrix`
 in `finally` tasks:

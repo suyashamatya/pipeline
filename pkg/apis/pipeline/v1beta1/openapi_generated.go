@@ -76,6 +76,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1.PipelineWorkspaceDeclaration":    schema_pkg_apis_pipeline_v1beta1_PipelineWorkspaceDeclaration(ref),
 		"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1.PropertySpec":                    schema_pkg_apis_pipeline_v1beta1_PropertySpec(ref),
 		"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1.Provenance":                      schema_pkg_apis_pipeline_v1beta1_Provenance(ref),
+		"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1.Ref":                             schema_pkg_apis_pipeline_v1beta1_Ref(ref),
 		"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1.RefSource":                       schema_pkg_apis_pipeline_v1beta1_RefSource(ref),
 		"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1.ResolverRef":                     schema_pkg_apis_pipeline_v1beta1_ResolverRef(ref),
 		"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1.ResultRef":                       schema_pkg_apis_pipeline_v1beta1_ResultRef(ref),
@@ -87,6 +88,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1.StepState":                       schema_pkg_apis_pipeline_v1beta1_StepState(ref),
 		"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1.StepTemplate":                    schema_pkg_apis_pipeline_v1beta1_StepTemplate(ref),
 		"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1.Task":                            schema_pkg_apis_pipeline_v1beta1_Task(ref),
+		"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1.TaskBreakpoints":                 schema_pkg_apis_pipeline_v1beta1_TaskBreakpoints(ref),
 		"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1.TaskList":                        schema_pkg_apis_pipeline_v1beta1_TaskList(ref),
 		"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1.TaskRef":                         schema_pkg_apis_pipeline_v1beta1_TaskRef(ref),
 		"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1.TaskResource":                    schema_pkg_apis_pipeline_v1beta1_TaskResource(ref),
@@ -2648,6 +2650,13 @@ func schema_pkg_apis_pipeline_v1beta1_PipelineTask(ref common.ReferenceCallback)
 							Ref:         ref("github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1.PipelineSpec"),
 						},
 					},
+					"onError": {
+						SchemaProps: spec.SchemaProps{
+							Description: "OnError defines the exiting behavior of a PipelineRun on error can be set to [ continue | stopAndFail ] Note: OnError is in preview mode and not yet supported",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
 				},
 			},
 		},
@@ -3043,6 +3052,26 @@ func schema_pkg_apis_pipeline_v1beta1_Provenance(ref common.ReferenceCallback) c
 		},
 		Dependencies: []string{
 			"github.com/tektoncd/pipeline/pkg/apis/config.FeatureFlags", "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1.ConfigSource", "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1.RefSource"},
+	}
+}
+
+func schema_pkg_apis_pipeline_v1beta1_Ref(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "Ref can be used to refer to a specific instance of a StepAction.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"name": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Name of the referenced step",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+				},
+			},
+		},
 	}
 }
 
@@ -3870,12 +3899,18 @@ func schema_pkg_apis_pipeline_v1beta1_Step(ref common.ReferenceCallback) common.
 							Ref:         ref("github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1.StepOutputConfig"),
 						},
 					},
+					"ref": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Contains the reference to an existing StepAction.",
+							Ref:         ref("github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1.Ref"),
+						},
+					},
 				},
 				Required: []string{"name"},
 			},
 		},
 		Dependencies: []string{
-			"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1.StepOutputConfig", "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1.WorkspaceUsage", "k8s.io/api/core/v1.ContainerPort", "k8s.io/api/core/v1.EnvFromSource", "k8s.io/api/core/v1.EnvVar", "k8s.io/api/core/v1.Lifecycle", "k8s.io/api/core/v1.Probe", "k8s.io/api/core/v1.ResourceRequirements", "k8s.io/api/core/v1.SecurityContext", "k8s.io/api/core/v1.VolumeDevice", "k8s.io/api/core/v1.VolumeMount", "k8s.io/apimachinery/pkg/apis/meta/v1.Duration"},
+			"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1.Ref", "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1.StepOutputConfig", "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1.WorkspaceUsage", "k8s.io/api/core/v1.ContainerPort", "k8s.io/api/core/v1.EnvFromSource", "k8s.io/api/core/v1.EnvVar", "k8s.io/api/core/v1.Lifecycle", "k8s.io/api/core/v1.Probe", "k8s.io/api/core/v1.ResourceRequirements", "k8s.io/api/core/v1.SecurityContext", "k8s.io/api/core/v1.VolumeDevice", "k8s.io/api/core/v1.VolumeMount", "k8s.io/apimachinery/pkg/apis/meta/v1.Duration"},
 	}
 }
 
@@ -4256,6 +4291,26 @@ func schema_pkg_apis_pipeline_v1beta1_Task(ref common.ReferenceCallback) common.
 	}
 }
 
+func schema_pkg_apis_pipeline_v1beta1_TaskBreakpoints(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "TaskBreakpoints defines the breakpoint config for a particular Task",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"onFailure": {
+						SchemaProps: spec.SchemaProps{
+							Description: "if enabled, pause TaskRun on failure of a step failed step will not exit",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
 func schema_pkg_apis_pipeline_v1beta1_TaskList(ref common.ReferenceCallback) common.OpenAPIDefinition {
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
@@ -4611,28 +4666,16 @@ func schema_pkg_apis_pipeline_v1beta1_TaskRunDebug(ref common.ReferenceCallback)
 				Description: "TaskRunDebug defines the breakpoint config for a particular TaskRun",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
-					"breakpoint": {
-						VendorExtensible: spec.VendorExtensible{
-							Extensions: spec.Extensions{
-								"x-kubernetes-list-type": "atomic",
-							},
-						},
+					"breakpoints": {
 						SchemaProps: spec.SchemaProps{
-							Type: []string{"array"},
-							Items: &spec.SchemaOrArray{
-								Schema: &spec.Schema{
-									SchemaProps: spec.SchemaProps{
-										Default: "",
-										Type:    []string{"string"},
-										Format:  "",
-									},
-								},
-							},
+							Ref: ref("github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1.TaskBreakpoints"),
 						},
 					},
 				},
 			},
 		},
+		Dependencies: []string{
+			"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1.TaskBreakpoints"},
 	}
 }
 
@@ -5677,7 +5720,6 @@ func schema_pkg_apis_pipeline_v1beta1_WhenExpression(ref common.ReferenceCallbac
 					"input": {
 						SchemaProps: spec.SchemaProps{
 							Description: "Input is the string for guard checking which can be a static input or an output from a parent Task",
-							Default:     "",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -5685,7 +5727,6 @@ func schema_pkg_apis_pipeline_v1beta1_WhenExpression(ref common.ReferenceCallbac
 					"operator": {
 						SchemaProps: spec.SchemaProps{
 							Description: "Operator that represents an Input's relationship to the values",
-							Default:     "",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -5710,8 +5751,14 @@ func schema_pkg_apis_pipeline_v1beta1_WhenExpression(ref common.ReferenceCallbac
 							},
 						},
 					},
+					"cel": {
+						SchemaProps: spec.SchemaProps{
+							Description: "CEL is a string of Common Language Expression, which can be used to conditionally execute the task based on the result of the expression evaluation More info about CEL syntax: https://github.com/google/cel-spec/blob/master/doc/langdef.md",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
 				},
-				Required: []string{"input", "operator", "values"},
 			},
 		},
 	}

@@ -626,22 +626,26 @@ func TestTaskRunSpec_Invalidate(t *testing.T) {
 				Name: "my-task",
 			},
 			Debug: &v1beta1.TaskRunDebug{
-				Breakpoint: []string{"onFailure"},
+				Breakpoints: &v1beta1.TaskBreakpoints{
+					OnFailure: "enabled",
+				},
 			},
 		},
 		wc:      cfgtesting.EnableStableAPIFields,
 		wantErr: apis.ErrGeneric("debug requires \"enable-api-fields\" feature gate to be \"alpha\" but it is \"stable\""),
 	}, {
-		name: "invalid breakpoint",
+		name: "invalid onFailure breakpoint",
 		spec: v1beta1.TaskRunSpec{
 			TaskRef: &v1beta1.TaskRef{
 				Name: "my-task",
 			},
 			Debug: &v1beta1.TaskRunDebug{
-				Breakpoint: []string{"breakito"},
+				Breakpoints: &v1beta1.TaskBreakpoints{
+					OnFailure: "turnOn",
+				},
 			},
 		},
-		wantErr: apis.ErrInvalidValue("breakito is not a valid breakpoint. Available valid breakpoints include [onFailure]", "debug.breakpoint"),
+		wantErr: apis.ErrInvalidValue("turnOn is not a valid onFailure breakpoint value, onFailure breakpoint is only allowed to be set as enabled", "debug.breakpoints.onFailure"),
 		wc:      cfgtesting.EnableAlphaAPIFields,
 	}, {
 		name: "stepOverride disallowed without alpha feature gate",
@@ -757,7 +761,7 @@ func TestTaskRunSpec_Invalidate(t *testing.T) {
 		),
 		wc: cfgtesting.EnableAlphaAPIFields,
 	}, {
-		name: "computeResources disallowed without alpha feature gate",
+		name: "computeResources disallowed without beta feature gate",
 		spec: v1beta1.TaskRunSpec{
 			TaskRef: &v1beta1.TaskRef{
 				Name: "foo",
@@ -769,7 +773,7 @@ func TestTaskRunSpec_Invalidate(t *testing.T) {
 			},
 		},
 		wc:      cfgtesting.EnableStableAPIFields,
-		wantErr: apis.ErrGeneric("computeResources requires \"enable-api-fields\" feature gate to be \"alpha\" but it is \"stable\""),
+		wantErr: apis.ErrGeneric("computeResources requires \"enable-api-fields\" feature gate to be \"alpha\" or \"beta\" but it is \"stable\""),
 	}, {
 		name: "uses resources",
 		spec: v1beta1.TaskRunSpec{
@@ -896,6 +900,78 @@ func TestTaskRunSpec_Validate(t *testing.T) {
 			}
 			if err := ts.spec.Validate(ctx); err != nil {
 				t.Error(err)
+			}
+		})
+	}
+}
+
+func TestTaskRunBetaFields(t *testing.T) {
+	tests := []struct {
+		name string
+		spec v1beta1.TaskSpec
+	}{{
+		name: "array param indexing",
+		spec: v1beta1.TaskSpec{
+			Params: []v1beta1.ParamSpec{{Name: "foo", Type: v1beta1.ParamTypeArray}},
+			Steps: []v1beta1.Step{{
+				Name:  "my-step",
+				Image: "my-image",
+				Script: `
+					#!/usr/bin/env  bash
+					echo $(params.foo[1])`,
+			}},
+		},
+	}, {
+		name: "object params",
+		spec: v1beta1.TaskSpec{
+			Params: []v1beta1.ParamSpec{{Name: "foo", Type: v1beta1.ParamTypeObject, Properties: map[string]v1beta1.PropertySpec{"bar": {Type: v1beta1.ParamTypeString}}}},
+			Steps: []v1beta1.Step{{
+				Name:  "my-step",
+				Image: "my-image",
+				Script: `
+					#!/usr/bin/env  bash
+					echo $(params.foo.bar)`,
+			}},
+		},
+	}, {
+		name: "array results",
+		spec: v1beta1.TaskSpec{
+			Results: []v1beta1.TaskResult{{Name: "array-result", Type: v1beta1.ResultsTypeArray}},
+			Steps: []v1beta1.Step{{
+				Name:  "my-step",
+				Image: "my-image",
+				Script: `
+					#!/usr/bin/env  bash
+					echo -n "[\"hello\",\"world\"]" | tee $(results.array-result.path)`,
+			}},
+		},
+	}, {
+		name: "object results",
+		spec: v1beta1.TaskSpec{
+			Results: []v1beta1.TaskResult{{Name: "object-result", Type: v1beta1.ResultsTypeObject,
+				Properties: map[string]v1beta1.PropertySpec{}}},
+			Steps: []v1beta1.Step{{
+				Name:  "my-step",
+				Image: "my-image",
+				Script: `
+					#!/usr/bin/env  bash
+					echo -n "{\"hello\":\"world\"}" | tee $(results.object-result.path)`,
+			}},
+		},
+	}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := cfgtesting.EnableStableAPIFields(context.Background())
+			tr := v1beta1.TaskRun{ObjectMeta: metav1.ObjectMeta{Name: "foo"}, Spec: v1beta1.TaskRunSpec{
+				TaskSpec: &tt.spec,
+			}}
+			if err := tr.Validate(ctx); err == nil {
+				t.Errorf("no error when using beta field when `enable-api-fields` is stable")
+			}
+
+			ctx = cfgtesting.EnableBetaAPIFields(context.Background())
+			if err := tr.Validate(ctx); err != nil {
+				t.Errorf("unexpected error when using beta field: %s", err)
 			}
 		})
 	}

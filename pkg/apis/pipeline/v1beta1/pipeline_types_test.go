@@ -73,6 +73,98 @@ func TestPipelineTask_ValidateName(t *testing.T) {
 	}
 }
 
+func TestPipelineTask_OnError(t *testing.T) {
+	tests := []struct {
+		name          string
+		p             PipelineTask
+		expectedError *apis.FieldError
+		wc            func(context.Context) context.Context
+	}{{
+		name: "valid PipelineTask with onError:continue",
+		p: PipelineTask{
+			Name:    "foo",
+			OnError: PipelineTaskContinue,
+			TaskRef: &TaskRef{Name: "foo"},
+		},
+		wc: cfgtesting.EnableAlphaAPIFields,
+	}, {
+		name: "valid PipelineTask with onError:stopAndFail",
+		p: PipelineTask{
+			Name:    "foo",
+			OnError: PipelineTaskStopAndFail,
+			TaskRef: &TaskRef{Name: "foo"},
+		},
+		wc: cfgtesting.EnableAlphaAPIFields,
+	}, {
+		name: "invalid OnError value",
+		p: PipelineTask{
+			Name:    "foo",
+			OnError: "invalid-val",
+			TaskRef: &TaskRef{Name: "foo"},
+		},
+		expectedError: apis.ErrInvalidValue("invalid-val", "OnError", "PipelineTask OnError must be either \"continue\" or \"stopAndFail\""),
+		wc:            cfgtesting.EnableAlphaAPIFields,
+	}, {
+		name: "OnError:stopAndFail and retries coexist - success",
+		p: PipelineTask{
+			Name:    "foo",
+			OnError: PipelineTaskStopAndFail,
+			Retries: 1,
+			TaskRef: &TaskRef{Name: "foo"},
+		},
+		wc: cfgtesting.EnableAlphaAPIFields,
+	}, {
+		name: "OnError:continue and retries coexists - failure",
+		p: PipelineTask{
+			Name:    "foo",
+			OnError: PipelineTaskContinue,
+			Retries: 1,
+			TaskRef: &TaskRef{Name: "foo"},
+		},
+		expectedError: apis.ErrGeneric("PipelineTask OnError cannot be set to \"continue\" when Retries is greater than 0"),
+		wc:            cfgtesting.EnableAlphaAPIFields,
+	}, {
+		name: "setting OnError in beta API version - failure",
+		p: PipelineTask{
+			Name:    "foo",
+			OnError: PipelineTaskContinue,
+			TaskRef: &TaskRef{Name: "foo"},
+		},
+		expectedError: apis.ErrGeneric("OnError requires \"enable-api-fields\" feature gate to be \"alpha\" but it is \"beta\""),
+		wc:            cfgtesting.EnableBetaAPIFields,
+	}, {
+		name: "setting OnError in stable API version - failure",
+		p: PipelineTask{
+			Name:    "foo",
+			OnError: PipelineTaskContinue,
+			TaskRef: &TaskRef{Name: "foo"},
+		},
+		expectedError: apis.ErrGeneric("OnError requires \"enable-api-fields\" feature gate to be \"alpha\" but it is \"stable\""),
+		wc:            cfgtesting.EnableStableAPIFields,
+	}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			if tt.wc != nil {
+				ctx = tt.wc(ctx)
+			}
+			err := tt.p.Validate(ctx)
+			if tt.expectedError == nil {
+				if err != nil {
+					t.Error("PipelineTask.Validate() returned error for valid pipeline task")
+				}
+			} else {
+				if err == nil {
+					t.Error("PipelineTask.Validate() did not return error for invalid pipeline task with OnError")
+				}
+				if d := cmp.Diff(tt.expectedError.Error(), err.Error(), cmpopts.IgnoreUnexported(apis.FieldError{})); d != "" {
+					t.Errorf("PipelineTask.Validate() errors diff %s", diff.PrintWantGot(d))
+				}
+			}
+		})
+	}
+}
+
 func TestPipelineTask_ValidateRefOrSpec(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -451,7 +543,7 @@ func TestPipelineTask_ValidateRegularTask_Success(t *testing.T) {
 	tests := []struct {
 		name            string
 		tasks           PipelineTask
-		enableAPIFields bool
+		enableAPIFields string
 		enableBundles   bool
 	}{{
 		name: "pipeline task - valid taskRef name",
@@ -459,29 +551,34 @@ func TestPipelineTask_ValidateRegularTask_Success(t *testing.T) {
 			Name:    "foo",
 			TaskRef: &TaskRef{Name: "example.com/my-foo-task"},
 		},
+		enableAPIFields: "stable",
 	}, {
 		name: "pipeline task - valid taskSpec",
 		tasks: PipelineTask{
 			Name:     "foo",
 			TaskSpec: &EmbeddedTask{TaskSpec: getTaskSpec()},
 		},
+		enableAPIFields: "stable",
 	}, {
 		name: "pipeline task - use of resolver",
 		tasks: PipelineTask{
 			TaskRef: &TaskRef{ResolverRef: ResolverRef{Resolver: "bar"}},
 		},
+		enableAPIFields: "beta",
 	}, {
 		name: "pipeline task - use of params",
 		tasks: PipelineTask{
 			TaskRef: &TaskRef{ResolverRef: ResolverRef{Resolver: "bar", Params: Params{}}},
 		},
+		enableAPIFields: "beta",
 	}, {
 		name: "pipeline task - use of bundle with the feature flag set",
 		tasks: PipelineTask{
 			Name:    "foo",
 			TaskRef: &TaskRef{Name: "bar", Bundle: "docker.io/foo"},
 		},
-		enableBundles: true,
+		enableBundles:   true,
+		enableAPIFields: "stable",
 	}}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -489,8 +586,8 @@ func TestPipelineTask_ValidateRegularTask_Success(t *testing.T) {
 			cfg := &config.Config{
 				FeatureFlags: &config.FeatureFlags{},
 			}
-			if tt.enableAPIFields {
-				cfg.FeatureFlags.EnableAPIFields = config.AlphaAPIFields
+			if tt.enableAPIFields != "" {
+				cfg.FeatureFlags.EnableAPIFields = tt.enableAPIFields
 			}
 			if tt.enableBundles {
 				cfg.FeatureFlags.EnableTektonOCIBundles = true
@@ -826,11 +923,12 @@ func TestPipelineTaskList_Validate(t *testing.T) {
 	}
 }
 
-func TestPipelineTask_validateMatrix(t *testing.T) {
+func TestPipelineTask_ValidateMatrix(t *testing.T) {
 	tests := []struct {
 		name     string
 		pt       *PipelineTask
 		wantErrs *apis.FieldError
+		tasks    []PipelineTask
 	}{{
 		name: "parameter duplicated in matrix.params and pipelinetask.params",
 		pt: &PipelineTask{
@@ -956,6 +1054,38 @@ func TestPipelineTask_validateMatrix(t *testing.T) {
 					Name: "browser", Value: ParamValue{Type: ParamTypeArray, ArrayVal: []string{"chrome", "firefox"}},
 				}}},
 		},
+	}, {
+		name: "valid matrix emitting string results consumed in aggregate by another pipelineTask",
+		pt: &PipelineTask{
+			Name:    "task-consuming-results",
+			TaskRef: &TaskRef{Name: "echoarrayurl"},
+			Params: Params{{
+				Name: "b-param", Value: ParamValue{Type: ParamTypeString, StringVal: "$(tasks.matrix-emitting-results-embedded.results.array-result[*])"},
+			}},
+		},
+		tasks: PipelineTaskList{},
+	}, {
+		name: "valid matrix emitting string results consumed in aggregate by another pipelineTask (embedded taskSpec)",
+		pt: &PipelineTask{
+			Name: "task-consuming-results",
+			TaskSpec: &EmbeddedTask{TaskSpec: TaskSpec{
+				Params: ParamSpecs{{
+					Name: "url", Type: "array",
+				}},
+				Steps: []Step{{
+					Name:  "use-environments",
+					Image: "bash:latest",
+					Args:  []string{"$(params.url[*])"},
+					Script: `for arg in "$@"; do
+							echo "URL: $arg"
+								done`,
+				}},
+			}},
+			Params: Params{{
+				Name: "b-param", Value: ParamValue{Type: ParamTypeString, StringVal: "$(tasks.matrix-emitting-results.results.report-url[*])"},
+			}},
+		},
+		tasks: PipelineTaskList{},
 	}}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1230,7 +1360,7 @@ func TestPipelineChecksum(t *testing.T) {
 				t.Fatalf("Error computing checksum: %v", err)
 			}
 
-			if d := cmp.Diff(hex.EncodeToString(sha), "ef400089e645c69a588e71fe629ce2a989743e303c058073b0829c6c6338ab8a"); d != "" {
+			if d := cmp.Diff("ef400089e645c69a588e71fe629ce2a989743e303c058073b0829c6c6338ab8a", hex.EncodeToString(sha)); d != "" {
 				t.Error(diff.PrintWantGot(d))
 			}
 		})

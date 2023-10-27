@@ -426,7 +426,7 @@ func TestHasTimedOut(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			result := tc.taskRun.HasTimedOut(context.Background(), testClock)
-			if d := cmp.Diff(result, tc.expectedStatus); d != "" {
+			if d := cmp.Diff(tc.expectedStatus, result); d != "" {
 				t.Fatalf(diff.PrintWantGot(d))
 			}
 		})
@@ -464,6 +464,83 @@ func TestInitializeTaskRunConditions(t *testing.T) {
 	newCondition := tr.Status.GetCondition(apis.ConditionSucceeded)
 	if newCondition.Reason != "not just started" {
 		t.Fatalf("PipelineRun initialize reset the condition reason to %s", newCondition.Reason)
+	}
+}
+
+func TestIsStepNeedDebug(t *testing.T) {
+	type args struct {
+		stepName string
+		trd      *v1beta1.TaskRunDebug
+	}
+	testCases := []struct {
+		name string
+		args args
+		want bool
+	}{
+		{
+			name: "empty breakpoints",
+			args: args{
+				stepName: "step1",
+				trd:      &v1beta1.TaskRunDebug{},
+			},
+			want: false,
+		}, {
+			name: "breakpoint on failure",
+			args: args{
+				stepName: "step1",
+				trd: &v1beta1.TaskRunDebug{
+					Breakpoints: &v1beta1.TaskBreakpoints{
+						OnFailure: "enabled",
+					},
+				},
+			},
+			want: true,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := tc.args.trd.StepNeedsDebug(tc.args.stepName)
+			if d := cmp.Diff(tc.want, result); d != "" {
+				t.Fatalf(diff.PrintWantGot(d))
+			}
+		})
+	}
+}
+
+func TestIsNeedDebug(t *testing.T) {
+	type args struct {
+		trd *v1beta1.TaskRunDebug
+	}
+	testCases := []struct {
+		name string
+		args args
+		want bool
+	}{
+		{
+			name: "empty breakpoints",
+			args: args{
+				trd: &v1beta1.TaskRunDebug{},
+			},
+			want: false,
+		}, {
+			name: "breakpoint on failure",
+			args: args{
+				trd: &v1beta1.TaskRunDebug{
+					Breakpoints: &v1beta1.TaskBreakpoints{
+						OnFailure: "enabled",
+					},
+				},
+			},
+			want: true,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := tc.args.trd.NeedsDebug()
+			if d := cmp.Diff(tc.want, result); d != "" {
+				t.Fatalf(diff.PrintWantGot(d))
+			}
+		})
 	}
 }
 

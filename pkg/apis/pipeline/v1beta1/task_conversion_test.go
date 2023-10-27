@@ -27,6 +27,7 @@ import (
 	"github.com/tektoncd/pipeline/test/diff"
 	"github.com/tektoncd/pipeline/test/parse"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"knative.dev/pkg/apis"
 )
 
 func TestTaskConversionBadType(t *testing.T) {
@@ -72,6 +73,15 @@ spec:
   steps:
   - image: foo
   - image: bar
+`
+	stepActionTaskYAML := `
+metadata:
+  name: foo
+  namespace: bar
+spec:
+  steps:
+    - ref:
+        name: "step-action"
 `
 	taskWithAllNoDeprecatedFieldsYAML := `
 metadata:
@@ -260,6 +270,9 @@ spec:
 	multiStepTaskV1beta1 := parse.MustParseV1beta1Task(t, multiStepTaskYAML)
 	multiStepTaskV1 := parse.MustParseV1Task(t, multiStepTaskYAML)
 
+	stepActionTaskV1beta1 := parse.MustParseV1beta1Task(t, stepActionTaskYAML)
+	stepActionTaskV1 := parse.MustParseV1Task(t, stepActionTaskYAML)
+
 	taskWithAllNoDeprecatedFieldsV1beta1 := parse.MustParseV1beta1Task(t, taskWithAllNoDeprecatedFieldsYAML)
 	taskWithAllNoDeprecatedFieldsV1 := parse.MustParseV1Task(t, taskWithAllNoDeprecatedFieldsYAML)
 
@@ -293,6 +306,10 @@ spec:
 		v1beta1Task: taskWithAllNoDeprecatedFieldsV1beta1,
 		v1Task:      taskWithAllNoDeprecatedFieldsV1,
 	}, {
+		name:        "step action in task",
+		v1beta1Task: stepActionTaskV1beta1,
+		v1Task:      stepActionTaskV1,
+	}, {
 		name:        "task conversion deprecated fields",
 		v1beta1Task: taskWithDeprecatedFieldsV1beta1,
 		v1Task:      taskWithDeprecatedFieldsV1,
@@ -324,5 +341,83 @@ spec:
 				t.Errorf("roundtrip %s", diff.PrintWantGot(d))
 			}
 		})
+	}
+}
+
+func TestTaskConversionFromDeprecated(t *testing.T) {
+	tests := []struct {
+		name string
+		in   *v1beta1.Task
+		want *v1beta1.Task
+	}{{
+		name: "input resources",
+		in: &v1beta1.Task{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "foo",
+				Namespace:  "bar",
+				Generation: 1,
+			},
+			Spec: v1beta1.TaskSpec{
+				Resources: &v1beta1.TaskResources{
+					Inputs: []v1beta1.TaskResource{{v1beta1.ResourceDeclaration{Name: "input-resource"}}},
+				},
+			},
+		},
+		want: &v1beta1.Task{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "foo",
+				Namespace:  "bar",
+				Generation: 1,
+			},
+			Spec: v1beta1.TaskSpec{
+				Resources: &v1beta1.TaskResources{
+					Inputs: []v1beta1.TaskResource{{v1beta1.ResourceDeclaration{Name: "input-resource"}}},
+				},
+			},
+		},
+	}, {
+		name: "output resources",
+		in: &v1beta1.Task{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "foo",
+				Namespace:  "bar",
+				Generation: 1,
+			},
+			Spec: v1beta1.TaskSpec{
+				Resources: &v1beta1.TaskResources{
+					Outputs: []v1beta1.TaskResource{{v1beta1.ResourceDeclaration{Name: "output-resource"}}},
+				},
+			},
+		},
+		want: &v1beta1.Task{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "foo",
+				Namespace:  "bar",
+				Generation: 1,
+			},
+			Spec: v1beta1.TaskSpec{Resources: &v1beta1.TaskResources{
+				Outputs: []v1beta1.TaskResource{{v1beta1.ResourceDeclaration{Name: "output-resource"}}},
+			}},
+		},
+	}}
+	for _, test := range tests {
+		versions := []apis.Convertible{&v1.Task{}}
+		for _, version := range versions {
+			t.Run(test.name, func(t *testing.T) {
+				ver := version
+				if err := test.in.ConvertTo(context.Background(), ver); err != nil {
+					t.Errorf("ConvertTo() = %v", err)
+				}
+				t.Logf("ConvertTo() = %#v", ver)
+				got := &v1beta1.Task{}
+				if err := got.ConvertFrom(context.Background(), ver); err != nil {
+					t.Errorf("ConvertFrom() = %v", err)
+				}
+				t.Logf("ConvertFrom() = %#v", got)
+				if d := cmp.Diff(test.want, got); d != "" {
+					t.Errorf("roundtrip %s", diff.PrintWantGot(d))
+				}
+			})
+		}
 	}
 }

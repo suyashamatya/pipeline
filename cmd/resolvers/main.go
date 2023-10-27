@@ -25,6 +25,7 @@ import (
 	"github.com/tektoncd/pipeline/pkg/resolution/resolver/cluster"
 	"github.com/tektoncd/pipeline/pkg/resolution/resolver/framework"
 	"github.com/tektoncd/pipeline/pkg/resolution/resolver/git"
+	"github.com/tektoncd/pipeline/pkg/resolution/resolver/http"
 	"github.com/tektoncd/pipeline/pkg/resolution/resolver/hub"
 	filteredinformerfactory "knative.dev/pkg/client/injection/kube/informers/factory/filtered"
 	"knative.dev/pkg/injection/sharedmain"
@@ -33,26 +34,23 @@ import (
 
 func main() {
 	ctx := filteredinformerfactory.WithSelectors(signals.NewContext(), v1alpha1.ManagedByLabelKey)
-	tektonHubURL := buildHubURL(os.Getenv("TEKTON_HUB_API"), "", hub.TektonHubYamlEndpoint)
-	artifactHubURL := buildHubURL(os.Getenv("ARTIFACT_HUB_API"), hub.DefaultArtifactHubURL, hub.ArtifactHubYamlEndpoint)
+	tektonHubURL := buildHubURL(os.Getenv("TEKTON_HUB_API"), "")
+	artifactHubURL := buildHubURL(os.Getenv("ARTIFACT_HUB_API"), hub.DefaultArtifactHubURL)
 
 	sharedmain.MainWithContext(ctx, "controller",
 		framework.NewController(ctx, &git.Resolver{}),
 		framework.NewController(ctx, &hub.Resolver{TektonHubURL: tektonHubURL, ArtifactHubURL: artifactHubURL}),
 		framework.NewController(ctx, &bundle.Resolver{}),
-		framework.NewController(ctx, &cluster.Resolver{}))
+		framework.NewController(ctx, &cluster.Resolver{}),
+		framework.NewController(ctx, &http.Resolver{}))
 }
 
-func buildHubURL(configAPI, defaultURL, yamlEndpoint string) string {
+func buildHubURL(configAPI, defaultURL string) string {
 	var hubURL string
 	if configAPI == "" {
 		hubURL = defaultURL
 	} else {
-		if !strings.HasSuffix(configAPI, "/") {
-			configAPI += "/"
-		}
-		hubURL = configAPI + yamlEndpoint
+		hubURL = configAPI
 	}
-
-	return hubURL
+	return strings.TrimSuffix(hubURL, "/")
 }

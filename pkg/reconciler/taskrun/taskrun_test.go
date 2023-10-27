@@ -1906,7 +1906,7 @@ status:
 				ignoreStatusTaskSpec,
 				ignoreTaskRunStatusFields,
 			}
-			if d := cmp.Diff(reconciledTaskRun, tc.wantTr, ignoreFields...); d != "" {
+			if d := cmp.Diff(tc.wantTr, reconciledTaskRun, ignoreFields...); d != "" {
 				t.Errorf("Didn't get expected TaskRun: %v", diff.PrintWantGot(d))
 			}
 
@@ -3583,6 +3583,7 @@ func TestFailTaskRun(t *testing.T) {
 		pod                *corev1.Pod
 		reason             v1.TaskRunReason
 		message            string
+		featureFlags       map[string]string
 		expectedStatus     apis.Condition
 		expectedStepStates []v1.StepState
 	}{{
@@ -3667,6 +3668,51 @@ status:
 			Type:    apis.ConditionSucceeded,
 			Status:  corev1.ConditionFalse,
 			Reason:  v1.TaskRunReasonCancelled.String(),
+			Message: "TaskRun test-taskrun-run-cancel was cancelled. Test cancellation message.",
+		},
+		expectedStepStates: []v1.StepState{
+			{
+				ContainerState: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						ExitCode: 1,
+						Reason:   v1.TaskRunReasonCancelled.String(),
+					},
+				},
+			},
+		},
+	}, {
+		name: "step-status-update-cancel-with-keep-pod-on-cancel",
+		taskRun: parse.MustParseV1TaskRun(t, `
+metadata:
+  name: test-taskrun-run-cancel
+  namespace: foo
+spec:
+  status: TaskRunCancelled
+  statusMessage: "Test cancellation message."
+  taskRef:
+    name: test-task
+status:
+  conditions:
+  - status: Unknown
+    type: Succeeded
+  podName: foo-is-bar
+  steps:
+  - running:
+      startedAt: "2022-01-01T00:00:00Z"
+`),
+		pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "foo",
+			Name:      "foo-is-bar",
+		}},
+		reason:  v1.TaskRunReasonCancelled,
+		message: "TaskRun test-taskrun-run-cancel was cancelled. Test cancellation message.",
+		featureFlags: map[string]string{
+			"keep-pod-on-cancel": "true",
+		},
+		expectedStatus: apis.Condition{
+			Type:    apis.ConditionSucceeded,
+			Status:  corev1.ConditionFalse,
+			Reason:  v1beta1.TaskRunReasonCancelled.String(),
 			Message: "TaskRun test-taskrun-run-cancel was cancelled. Test cancellation message.",
 		},
 		expectedStepStates: []v1.StepState{
@@ -3904,6 +3950,15 @@ status:
 		t.Run(tc.name, func(t *testing.T) {
 			d := test.Data{
 				TaskRuns: []*v1.TaskRun{tc.taskRun},
+				ConfigMaps: []*corev1.ConfigMap{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      config.GetFeatureFlagsConfigName(),
+							Namespace: system.Namespace(),
+						},
+						Data: tc.featureFlags,
+					},
+				},
 			}
 			if tc.pod != nil {
 				d.Pods = []*corev1.Pod{tc.pod}
@@ -3930,7 +3985,7 @@ status:
 			if err != nil {
 				t.Fatal(err)
 			}
-			if d := cmp.Diff(tc.taskRun.Status.GetCondition(apis.ConditionSucceeded), &tc.expectedStatus, ignoreLastTransitionTime); d != "" {
+			if d := cmp.Diff(&tc.expectedStatus, tc.taskRun.Status.GetCondition(apis.ConditionSucceeded), ignoreLastTransitionTime); d != "" {
 				t.Fatalf(diff.PrintWantGot(d))
 			}
 
@@ -4034,7 +4089,7 @@ spec:
 			if err := storeTaskSpecAndMergeMeta(context.Background(), tr, tc.reconcile1Args.taskSpec, tc.reconcile1Args.resolvedObjectMeta); err != nil {
 				t.Errorf("storePipelineSpec() error = %v", err)
 			}
-			if d := cmp.Diff(tr, tc.wantTaskRun); d != "" {
+			if d := cmp.Diff(tc.wantTaskRun, tr); d != "" {
 				t.Fatalf(diff.PrintWantGot(d))
 			}
 
@@ -4042,7 +4097,7 @@ spec:
 			if err := storeTaskSpecAndMergeMeta(context.Background(), tr, tc.reconcile2Args.taskSpec, tc.reconcile2Args.resolvedObjectMeta); err != nil {
 				t.Errorf("storePipelineSpec() error = %v", err)
 			}
-			if d := cmp.Diff(tr, tc.wantTaskRun); d != "" {
+			if d := cmp.Diff(tc.wantTaskRun, tr); d != "" {
 				t.Fatalf(diff.PrintWantGot(d))
 			}
 		})
@@ -4067,10 +4122,10 @@ func Test_storeTaskSpec_metadata(t *testing.T) {
 	if err := storeTaskSpecAndMergeMeta(context.Background(), tr, &v1.TaskSpec{}, &resolvedMeta); err != nil {
 		t.Errorf("storeTaskSpecAndMergeMeta error = %v", err)
 	}
-	if d := cmp.Diff(tr.ObjectMeta.Labels, wantedlabels); d != "" {
+	if d := cmp.Diff(wantedlabels, tr.ObjectMeta.Labels); d != "" {
 		t.Fatalf(diff.PrintWantGot(d))
 	}
-	if d := cmp.Diff(tr.ObjectMeta.Annotations, wantedannotations); d != "" {
+	if d := cmp.Diff(wantedannotations, tr.ObjectMeta.Annotations); d != "" {
 		t.Fatalf(diff.PrintWantGot(d))
 	}
 }
@@ -4348,7 +4403,7 @@ status:
 	}
 
 	// check that injected sidecar is replaced with nop image
-	if d := cmp.Diff(retrievedPod.Spec.Containers[1].Image, images.NopImage); d != "" {
+	if d := cmp.Diff(images.NopImage, retrievedPod.Spec.Containers[1].Image); d != "" {
 		t.Errorf("expected injected sidecar image to be replaced with nop image %s", diff.PrintWantGot(d))
 	}
 }
@@ -4994,7 +5049,7 @@ status:
 			if err != nil {
 				t.Fatalf("getting updated taskrun: %v", err)
 			}
-			if d := cmp.Diff(tr.Status.Results, tc.expectedResults); d != "" {
+			if d := cmp.Diff(tc.expectedResults, tr.Status.Results); d != "" {
 				t.Errorf("got unexpected results %s", diff.PrintWantGot(d))
 			}
 			condition := tr.Status.GetCondition(apis.ConditionSucceeded)

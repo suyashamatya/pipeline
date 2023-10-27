@@ -90,26 +90,40 @@ For more information on support windows, see the [deprecations table](./docs/dep
 
 ## Feature Gates
 
-CRD API versions gate the overall stability of the CRD and its default behaviors. Within a particular CRD version, certain opt-in features may be at a lower stability level as described in [TEP-33](https://github.com/tektoncd/community/blob/main/teps/0033-tekton-feature-gates.md). These fields may be disabled by default and can be enabled by setting the right `enable-api-fields` feature-flag as described in TEP-33:
+Stability levels of feature gates are independent from CRD apiVersions. 
 
-* `stable` - This value indicates that only fields of the highest stability level are enabled; For `beta` CRDs, this means only beta stability fields are enabled, i.e. `alpha` fields are not enabled. For `GA` CRDs, this means only `GA` fields are enabled, i.e. `beta` and `alpha` fields would not be enabled. TODO(#6592): Decouple feature stability from API stability.
-* `beta` (default) - This value indicates that only fields which are of `beta` (or greater) stability are enabled, i.e. `alpha` fields are not enabled. 
-* `alpha` - This value indicates that fields of all stability levels are enabled, specifically `alpha`, `beta` and `GA`.
+[TEP0138](https://github.com/tektoncd/community/blob/main/teps/0138-decouple-api-and-feature-versioning.md) has introduced per-feature flags for new API-driven features and the migration plan for `enable-api-fields`. Please refer to the table below for the API-driven features validation transition:
+
+| Releases               | Global flag `enable-api-fields`    | Per-feature flag                   |
+| ---------------------- | --------------------------------   | ---------------------------------- |
+| Prior to v0.53.0       | All alpha/beta API-driven features |                                    |
+| After v0.53.0        | [Existing alpha/beta API-driven features](https://github.com/tektoncd/community/blob/02418c0d39578a6a42f9d2d30caea8060dd89385/teps/0138-decouple-api-and-feature-versioning.md#sunset-enable-api-fields-after-existing-features-stabilize) prior to v0.53.0 | New alpha/beta API-driven features introduced after v0.53.0 |
+| All [alpha/beta API-driven features in v0.53.0](https://github.com/tektoncd/community/blob/02418c0d39578a6a42f9d2d30caea8060dd89385/teps/0138-decouple-api-and-feature-versioning.md#sunset-enable-api-fields-after-existing-features-stabilize) become stable or are removed | Sunset ~~`enable-api-fields`~~ | All alpha/beta API-driven features |
 
 
-| Feature Versions -> | v1 | beta | alpha |
-|---------------------|----|------|-------|
-| stable              | x  |      |       |
-| beta                | x  | x    |       |
-| alpha               | x  | x    | x     |
+_Note that behavioural(non-API-driven) flags will retain their original usage._
 
+With per-feature flags, cluster operators are able to enable a single new feature with their dedicated feature flags. For instructions on how to add a per-feature flag, please check the [developer feature versioning guide](./docs/developers/feature-versioning.md#per-feature-flag).
+
+Note that the `enable-api-fields` feature flag will continue to validate all features that were[beta](https://github.com/tektoncd/pipeline/blob/release-v0.52.x/docs/additional-configs.md#beta-features) and [alpha](https://github.com/tektoncd/pipeline/blob/release-v0.52.x/docs/additional-configs.md#alpha-features) prior to [v0.53.0](https://github.com/tektoncd/pipeline/tree/release-v0.53.x):
+
+* `stable` - This value indicates that only fields of the highest stability level are enabled; i.e. `alpha` and `beta` fields are not enabled.
+
+* `beta` (default) - This value indicates that only fields which are of `beta` (or greater) stability are enabled, i.e. `alpha` fields are not enabled.
+
+* `alpha` - This value indicates that fields of all stability levels are enabled, specifically `alpha`, `beta` and `GA`(`stable`).
 
 See the current list of [alpha features](https://github.com/tektoncd/pipeline/blob/main/docs/additional-configs.md#alpha-features) and [beta features](https://github.com/tektoncd/pipeline/blob/main/docs/additional-configs.md#beta-features).
 
+| `enable-api-fields` value  | stable features enabled | beta features enabled | alpha features enabled |
+|----------------------------|-------------------------|-----------------------|------------------------|
+| stable                     |             x           |                       |                        |
+| beta                       |             x           |          x            |                        |
+| alpha                      |             x           |          x            |           x            |
 
 ### Alpha features
 
-- Alpha feature in beta or GA CRDs are disabled by default and must be enabled by [setting `enable-api-fields` to `alpha`](https://github.com/tektoncd/pipeline/blob/main/docs/additional-configs.md#alpha-features)
+- Alpha features are disabled by default and must be enabled by [setting `enable-api-fields` to `alpha`](https://github.com/tektoncd/pipeline/blob/main/docs/additional-configs.md#alpha-features)
 
 - These features may be dropped or backwards incompatible changes made at any time, though one release worth of warning will be provided.
 
@@ -125,16 +139,30 @@ See the current list of [alpha features](https://github.com/tektoncd/pipeline/bl
   i.e. by providing a 9 month support period.
 
 - Beta features are reviewed for promotion to GA/Stable on a regular basis. However, there is no guarantee that they will be promoted to GA/stable.
-
-- For beta API versions, beta is the highest level of stability possible for any feature.
   
 ### GA/Stable features
 
-- GA/Stable features are present in a [GA CRD](#ga-crds) only.
+- GA/Stable features are enabled by default.
+  - GA/Stable API-driven features are no longer controlled by the `enable-api-fields` flag because they cannot be disabled.
 
-- GA/Stable features are enabled by default
+- GA/Stable features are features that have been promoted from beta to the highest level of stability. They cannot be disabled in any CRD version.
 
 - GA/Stable features will not be removed or changed in a backwards incompatible manner without incrementing the API Version.
+
+### Feature Graduation Process
+Features are first released as experimental in alpha, refined in beta, and finalized in stable releases.
+
+#### Introducing an `alpha` feature
+- When a feature is first introduced to Tekton, it will have the `alpha` stability level and be disabled by default. 
+- At this stage, users could choose to experiment with the feature. Feedback will be collected from users and it will help maintainers to determine whether to promote the feature to higher stability level or deprecate it.
+
+#### Promoting a feature to `beta`
+- After feedback of the usage of the alpha features, once the needs and motivations are validated, a feature could be promoted to `beta`. This stage is where features are further tested and refined.
+- The dedicated feature flag for this feature will change its stability level to `beta`. It will continue to be disabled by default.
+
+#### Graduating a feature to `stable`
+- This is the final stage of feature graduation process, where features are considered to be complete and ready to be released for the public.
+- Once a feature has graduated to `stable`, it will be turned on by default.
 
 ## Approving API changes
 

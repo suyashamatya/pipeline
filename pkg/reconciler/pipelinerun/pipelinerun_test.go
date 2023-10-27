@@ -43,11 +43,14 @@ import (
 	resolutionutil "github.com/tektoncd/pipeline/pkg/internal/resolution"
 	"github.com/tektoncd/pipeline/pkg/reconciler/events/cloudevent"
 	"github.com/tektoncd/pipeline/pkg/reconciler/events/k8sevent"
+	"github.com/tektoncd/pipeline/pkg/reconciler/pipeline/dag"
 	"github.com/tektoncd/pipeline/pkg/reconciler/pipelinerun/resources"
+	taskresources "github.com/tektoncd/pipeline/pkg/reconciler/taskrun/resources"
 	ttesting "github.com/tektoncd/pipeline/pkg/reconciler/testing"
 	"github.com/tektoncd/pipeline/pkg/reconciler/volumeclaim"
 	resolutioncommon "github.com/tektoncd/pipeline/pkg/resolution/common"
 	remoteresource "github.com/tektoncd/pipeline/pkg/resolution/resource"
+	"github.com/tektoncd/pipeline/pkg/tracing"
 	"github.com/tektoncd/pipeline/pkg/trustedresources"
 	"github.com/tektoncd/pipeline/pkg/trustedresources/verifier"
 	"github.com/tektoncd/pipeline/test"
@@ -1210,7 +1213,7 @@ status:
 	}
 
 	// The PipelineRun should be marked as failed due to InvalidTaskResultReference.
-	if d := cmp.Diff(reconciledRun, expectedPipelineRun, ignoreResourceVersion, ignoreLastTransitionTime, ignoreTypeMeta,
+	if d := cmp.Diff(expectedPipelineRun, reconciledRun, ignoreResourceVersion, ignoreLastTransitionTime, ignoreTypeMeta,
 		ignoreStartTime, ignoreCompletionTime, ignoreProvenance); d != "" {
 		t.Errorf("Expected to see PipelineRun run marked as failed with the reason: InvalidTaskResultReference. Diff %s", diff.PrintWantGot(d))
 	}
@@ -1359,7 +1362,7 @@ status:
 		t.Errorf("Expected PipelineRun status to be complete, but was %v", reconciledRun.Status.GetCondition(apis.ConditionSucceeded))
 	}
 
-	if d := cmp.Diff(reconciledRun.Status.ChildReferences, expectedChildReferences); d != "" {
+	if d := cmp.Diff(expectedChildReferences, reconciledRun.Status.ChildReferences); d != "" {
 		t.Fatalf("Expected PipelineRun status to match ChildReference(s) status, but got a mismatch %s", diff.PrintWantGot(d))
 	}
 
@@ -2691,7 +2694,7 @@ spec:
 `)}
 	prName := "test-pipeline-run-with-timeout"
 	ts := []*v1.Task{simpleHelloWorldTask}
-	trs := []*v1.TaskRun{
+	oneFinishedTRs := []*v1.TaskRun{
 		getTaskRun(
 			t,
 			"test-pipeline-run-with-timeout-hello-world",
@@ -2708,12 +2711,26 @@ spec:
     name: hello-world
     kind: Task
 `)}
+	oneStartedTRs := []*v1.TaskRun{
+		getTaskRun(
+			t,
+			"test-pipeline-run-with-timeout-hello-world",
+			prName,
+			ps[0].Name,
+			"hello-world",
+			corev1.ConditionUnknown,
+		),
+	}
 
 	tcs := []struct {
-		name string
-		pr   *v1.PipelineRun
+		name                    string
+		trs                     []*v1.TaskRun
+		pr                      *v1.PipelineRun
+		wantFinallyTimeout      bool
+		wantOneFinalTaskSkipped bool
 	}{{
 		name: "finally timeout specified",
+		trs:  oneFinishedTRs,
 		pr: parse.MustParseV1PipelineRun(t, fmt.Sprintf(`
 metadata:
   name: %s
@@ -2746,8 +2763,11 @@ status:
         status: "Unknown"
         type: Succeeded
 `, prName)),
+		wantFinallyTimeout:      true,
+		wantOneFinalTaskSkipped: true,
 	}, {
 		name: "finally timeout calculated",
+		trs:  oneFinishedTRs,
 		pr: parse.MustParseV1PipelineRun(t, fmt.Sprintf(`
 metadata:
   name: %s
@@ -2781,13 +2801,43 @@ status:
         status: "Unknown"
         type: Succeeded
 `, prName)),
+		wantFinallyTimeout:      true,
+		wantOneFinalTaskSkipped: true,
+	}, {
+		name: "finally timeout specified and pipeline timeout set to 0",
+		trs:  oneStartedTRs,
+		pr: parse.MustParseV1PipelineRun(t, fmt.Sprintf(`
+metadata:
+  name: %s
+  namespace: foo
+spec:
+  pipelineRef:
+    name: test-pipeline-with-finally
+  timeouts:
+    finally: 15m
+    pipeline: 0s
+status:
+  startTime: "2021-12-31T23:40:00Z"
+  childReferences:
+  - name: test-pipeline-run-with-timeout-hello-world
+    apiVersion: tekton.dev/v1
+    kind: TaskRun
+    pipelineTaskName: task1
+    status:
+      conditions:
+      - lastTransitionTime: null
+        status: Unknown
+        type: Succeeded
+`, prName)),
+		wantFinallyTimeout:      false,
+		wantOneFinalTaskSkipped: false,
 	}}
 	for _, tc := range tcs {
 		d := test.Data{
 			PipelineRuns: []*v1.PipelineRun{tc.pr},
 			Pipelines:    ps,
 			Tasks:        ts,
-			TaskRuns:     trs,
+			TaskRuns:     tc.trs,
 		}
 		prt := newPipelineRunTest(t, d)
 		defer prt.Cancel()
@@ -2807,22 +2857,26 @@ status:
 		}
 
 		// Check that there is a skipped task for the expected reason
-		if len(reconciledRun.Status.SkippedTasks) != 1 {
-			t.Errorf("expected one skipped task, found %d", len(reconciledRun.Status.SkippedTasks))
-		} else if reconciledRun.Status.SkippedTasks[0].Reason != v1.FinallyTimedOutSkip {
-			t.Errorf("expected skipped reason to be '%s', but was '%s", v1.FinallyTimedOutSkip, reconciledRun.Status.SkippedTasks[0].Reason)
+		if tc.wantOneFinalTaskSkipped {
+			if len(reconciledRun.Status.SkippedTasks) != 1 {
+				t.Errorf("expected one skipped task, found %d", len(reconciledRun.Status.SkippedTasks))
+			} else if reconciledRun.Status.SkippedTasks[0].Reason != v1.FinallyTimedOutSkip {
+				t.Errorf("expected skipped reason to be '%s', but was '%s", v1.FinallyTimedOutSkip, reconciledRun.Status.SkippedTasks[0].Reason)
+			}
 		}
 
-		updatedTaskRun, err := clients.Pipeline.TektonV1().TaskRuns("foo").Get(context.Background(), trs[1].Name, metav1.GetOptions{})
-		if err != nil {
-			t.Fatalf("error getting updated TaskRun: %#v", err)
-		}
+		if tc.wantFinallyTimeout {
+			updatedTaskRun, err := clients.Pipeline.TektonV1().TaskRuns("foo").Get(context.Background(), tc.trs[1].Name, metav1.GetOptions{})
+			if err != nil {
+				t.Fatalf("error getting updated TaskRun: %#v", err)
+			}
 
-		if updatedTaskRun.Spec.Status != v1.TaskRunSpecStatusCancelled {
-			t.Errorf("expected existing TaskRun Spec.Status to be set to %s, but was %s", v1.TaskRunSpecStatusCancelled, updatedTaskRun.Spec.Status)
-		}
-		if updatedTaskRun.Spec.StatusMessage != v1.TaskRunCancelledByPipelineTimeoutMsg {
-			t.Errorf("expected existing TaskRun Spec.StatusMessage to be set to %s, but was %s", v1.TaskRunCancelledByPipelineTimeoutMsg, updatedTaskRun.Spec.StatusMessage)
+			if updatedTaskRun.Spec.Status != v1.TaskRunSpecStatusCancelled {
+				t.Errorf("expected existing TaskRun Spec.Status to be set to %s, but was %s", v1.TaskRunSpecStatusCancelled, updatedTaskRun.Spec.Status)
+			}
+			if updatedTaskRun.Spec.StatusMessage != v1.TaskRunCancelledByPipelineTimeoutMsg {
+				t.Errorf("expected existing TaskRun Spec.StatusMessage to be set to %s, but was %s", v1.TaskRunCancelledByPipelineTimeoutMsg, updatedTaskRun.Spec.StatusMessage)
+			}
 		}
 	}
 }
@@ -3324,7 +3378,7 @@ spec:
 		if err != nil {
 			t.Fatalf("Expected a TaskRun to be created, but it wasn't: %s", err)
 		}
-		if d := cmp.Diff(actual, expectedTaskRuns[i], ignoreResourceVersion, ignoreTypeMeta); d != "" {
+		if d := cmp.Diff(expectedTaskRuns[i], actual, ignoreResourceVersion, ignoreTypeMeta); d != "" {
 			t.Errorf("expected to see TaskRun %v created. Diff %s", expectedTaskRuns[i], diff.PrintWantGot(d))
 		}
 	}
@@ -3672,7 +3726,7 @@ spec:
 			Values:   []string{"yes"},
 		}},
 	}}
-	if d := cmp.Diff(actualSkippedTasks, expectedSkippedTasks); d != "" {
+	if d := cmp.Diff(expectedSkippedTasks, actualSkippedTasks); d != "" {
 		t.Errorf("expected to find Skipped Tasks %v. Diff %s", expectedSkippedTasks, diff.PrintWantGot(d))
 	}
 
@@ -4018,6 +4072,210 @@ status:
 			t.Fatalf("Expected 0 TaskRuns got %d", len(actualSkippedTask.Items))
 		}
 	}
+}
+
+func TestReconcileWithCELWhenExpressionsWithTaskResultsAndParams(t *testing.T) {
+	ps := []*v1.Pipeline{parse.MustParseV1Pipeline(t, `
+metadata:
+  name: test-pipeline
+  namespace: foo
+spec:
+  params:
+  - name: run
+    type: string
+  tasks:
+  - name: a-task
+    taskRef:
+      name: a-task
+  - name: b-task
+    taskRef:
+      name: b-task
+    when:
+    - cel: "'$(tasks.a-task.results.aResult)' == 'aResultValue'"
+  - name: c-task
+    taskRef:
+      name: c-task
+    when:
+    - cel: "'$(tasks.a-task.results.aResult)' == 'missing'"
+    - cel: "'$(params.run)'!='yes'"
+  - name: d-task
+    runAfter:
+    - c-task
+    taskRef:
+      name: d-task
+`)}
+	prs := []*v1.PipelineRun{parse.MustParseV1PipelineRun(t, `
+metadata:
+  name: test-pipeline-run-different-service-accs
+  namespace: foo
+spec:
+  params:
+  - name: run
+    value: "yes"
+  pipelineRef:
+    name: test-pipeline
+  taskRunTemplate:
+    serviceAccountName: test-sa-0
+`)}
+	ts := []*v1.Task{
+		{ObjectMeta: baseObjectMeta("a-task", "foo")},
+		{ObjectMeta: baseObjectMeta("b-task", "foo")},
+		{ObjectMeta: baseObjectMeta("c-task", "foo")},
+		{ObjectMeta: baseObjectMeta("d-task", "foo")},
+	}
+	trs := []*v1.TaskRun{mustParseTaskRunWithObjectMeta(t,
+		taskRunObjectMeta("test-pipeline-run-different-service-accs-a-task-xxyyy", "foo", "test-pipeline-run-different-service-accs",
+			"test-pipeline", "a-task", true),
+		`
+spec:
+  serviceAccountName: test-sa
+  taskRef:
+    name: hello-world
+  timeout: 1h0m0s
+status:
+  conditions:
+  - status: "True"
+    type: Succeeded
+  results:
+  - name: aResult
+    value: aResultValue
+`)}
+	cms := []*corev1.ConfigMap{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: config.GetFeatureFlagsConfigName(), Namespace: system.Namespace()},
+			Data: map[string]string{
+				"enable-cel-in-whenexpression": "true",
+			},
+		},
+	}
+	d := test.Data{
+		PipelineRuns: prs,
+		Pipelines:    ps,
+		Tasks:        ts,
+		TaskRuns:     trs,
+		ConfigMaps:   cms,
+	}
+	prt := newPipelineRunTest(t, d)
+	defer prt.Cancel()
+
+	wantEvents := []string{
+		"Normal Started",
+		"Normal Running Tasks Completed: 1 \\(Failed: 0, Cancelled 0\\), Incomplete: 2, Skipped: 1",
+	}
+	pipelineRun, clients := prt.reconcileRun("foo", "test-pipeline-run-different-service-accs", wantEvents, false)
+
+	expectedTaskRunName := "test-pipeline-run-different-service-accs-b-task"
+	expectedTaskRun := mustParseTaskRunWithObjectMeta(t,
+		taskRunObjectMeta(expectedTaskRunName, "foo", "test-pipeline-run-different-service-accs", "test-pipeline", "b-task", false),
+		`
+spec:
+  serviceAccountName: test-sa-0
+  taskRef:
+    name: b-task
+    kind: Task
+`)
+	// Check that the expected TaskRun was created
+	actual, err := clients.Pipeline.TektonV1().TaskRuns("foo").List(prt.TestAssets.Ctx, metav1.ListOptions{
+		LabelSelector: "tekton.dev/pipelineTask=b-task,tekton.dev/pipelineRun=test-pipeline-run-different-service-accs",
+		Limit:         1,
+	})
+
+	if err != nil {
+		t.Fatalf("Failure to list TaskRun's %s", err)
+	}
+	if len(actual.Items) != 1 {
+		t.Fatalf("Expected 1 TaskRuns got %d", len(actual.Items))
+	}
+	actualTaskRun := actual.Items[0]
+	if d := cmp.Diff(expectedTaskRun, &actualTaskRun, ignoreResourceVersion, ignoreTypeMeta); d != "" {
+		t.Errorf("expected to see TaskRun %v created. Diff %s", expectedTaskRunName, diff.PrintWantGot(d))
+	}
+
+	expectedWhenExpressionsInTaskRun := []v1.WhenExpression{{
+		CEL: "'aResultValue' == 'aResultValue'",
+	}}
+	verifyTaskRunStatusesWhenExpressions(t, pipelineRun.Status, expectedTaskRunName, expectedWhenExpressionsInTaskRun)
+
+	actualSkippedTasks := pipelineRun.Status.SkippedTasks
+	expectedSkippedTasks := []v1.SkippedTask{{
+		Name:   "c-task",
+		Reason: v1.WhenExpressionsSkip,
+		WhenExpressions: v1.WhenExpressions{{
+			CEL: "'aResultValue' == 'missing'",
+		}, {
+			CEL: "'yes'!='yes'",
+		}},
+	}}
+	if d := cmp.Diff(expectedSkippedTasks, actualSkippedTasks); d != "" {
+		t.Errorf("expected to find Skipped Tasks %v. Diff %s", expectedSkippedTasks, diff.PrintWantGot(d))
+	}
+
+	skippedTasks := []string{"c-task"}
+	for _, skippedTask := range skippedTasks {
+		labelSelector := fmt.Sprintf("tekton.dev/pipelineTask=%s,tekton.dev/pipelineRun=test-pipeline-run-different-service-accs", skippedTask)
+		actualSkippedTask, err := clients.Pipeline.TektonV1().TaskRuns("foo").List(prt.TestAssets.Ctx, metav1.ListOptions{
+			LabelSelector: labelSelector,
+			Limit:         1,
+		})
+		if err != nil {
+			t.Fatalf("Failure to list TaskRun's %s", err)
+		}
+		if len(actualSkippedTask.Items) != 0 {
+			t.Fatalf("Expected 0 TaskRuns got %d", len(actualSkippedTask.Items))
+		}
+	}
+}
+
+func TestReconcile_InvalidCELWhenExpressions(t *testing.T) {
+	ps := []*v1.Pipeline{parse.MustParseV1Pipeline(t, `
+metadata:
+  name: test-pipeline
+  namespace: foo
+spec:
+  params:
+  - name: run
+    type: string
+  tasks:
+  - name: a-task
+    taskRef:
+      name: a-task
+    when:
+    - cel: "{'blue': '0x000080', 'red': '0xFF0000'}['red']"
+`)}
+	prs := []*v1.PipelineRun{parse.MustParseV1PipelineRun(t, `
+metadata:
+  name: test-pipeline-run-different-service-accs
+  namespace: foo
+spec:
+  params:
+  - name: run
+    value: "yes"
+  pipelineRef:
+    name: test-pipeline
+  taskRunTemplate:
+    serviceAccountName: test-sa-0
+`)}
+	ts := []*v1.Task{
+		{ObjectMeta: baseObjectMeta("a-task", "foo")},
+	}
+	cms := []*corev1.ConfigMap{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: config.GetFeatureFlagsConfigName(), Namespace: system.Namespace()},
+			Data: map[string]string{
+				"enable-cel-in-whenexpression": "true",
+			},
+		},
+	}
+	d := test.Data{
+		PipelineRuns: prs,
+		Pipelines:    ps,
+		Tasks:        ts,
+		ConfigMaps:   cms,
+	}
+	prt := newPipelineRunTest(t, d)
+	defer prt.Cancel()
+	pipelineRun, _ := prt.reconcileRun("foo", "test-pipeline-run-different-service-accs", []string{}, true)
+	checkPipelineRunConditionStatusAndReason(t, pipelineRun, corev1.ConditionFalse, string(v1.PipelineRunReasonCELEvaluationFailed))
 }
 
 // TestReconcileWithAffinityAssistantStatefulSet tests that given a pipelineRun with workspaces,
@@ -5086,10 +5344,10 @@ status:
 
 	reconciledRun, _ := prt.reconcileRun("foo", "test-failed-pr-with-task-results", []string{}, false)
 
-	if d := cmp.Diff(reconciledRun.Status.Conditions, wantPrs[0].Status.Conditions, ignoreResourceVersion, ignoreLastTransitionTime); d != "" {
+	if d := cmp.Diff(wantPrs[0].Status.Conditions, reconciledRun.Status.Conditions, ignoreResourceVersion, ignoreLastTransitionTime); d != "" {
 		t.Errorf("expected to see pipeline run marked as failed. Diff %s", diff.PrintWantGot(d))
 	}
-	if d := cmp.Diff(reconciledRun.Status.Results, wantPrs[0].Status.Results, ignoreResourceVersion, ignoreLastTransitionTime); d != "" {
+	if d := cmp.Diff(wantPrs[0].Status.Results, reconciledRun.Status.Results, ignoreResourceVersion, ignoreLastTransitionTime); d != "" {
 		t.Errorf("expected to see pipeline run results created. Diff %s", diff.PrintWantGot(d))
 	}
 }
@@ -5175,7 +5433,7 @@ metadata:
 			if err := storePipelineSpecAndMergeMeta(context.Background(), pr, tc.reconcile1Args.pipelineSpec, tc.reconcile1Args.resolvedObjectMeta); err != nil {
 				t.Errorf("storePipelineSpec() error = %v", err)
 			}
-			if d := cmp.Diff(pr, tc.wantPipelineRun); d != "" {
+			if d := cmp.Diff(tc.wantPipelineRun, pr); d != "" {
 				t.Fatalf(diff.PrintWantGot(d))
 			}
 
@@ -5183,7 +5441,7 @@ metadata:
 			if err := storePipelineSpecAndMergeMeta(context.Background(), pr, tc.reconcile2Args.pipelineSpec, tc.reconcile2Args.resolvedObjectMeta); err != nil {
 				t.Errorf("storePipelineSpec() error = %v", err)
 			}
-			if d := cmp.Diff(pr, tc.wantPipelineRun); d != "" {
+			if d := cmp.Diff(tc.wantPipelineRun, pr); d != "" {
 				t.Fatalf(diff.PrintWantGot(d))
 			}
 		})
@@ -5207,10 +5465,10 @@ func Test_storePipelineSpec_metadata(t *testing.T) {
 	}); err != nil {
 		t.Errorf("storePipelineSpecAndMergeMeta error = %v", err)
 	}
-	if d := cmp.Diff(pr.ObjectMeta.Labels, wantedlabels); d != "" {
+	if d := cmp.Diff(wantedlabels, pr.ObjectMeta.Labels); d != "" {
 		t.Fatalf(diff.PrintWantGot(d))
 	}
-	if d := cmp.Diff(pr.ObjectMeta.Annotations, wantedannotations); d != "" {
+	if d := cmp.Diff(wantedannotations, pr.ObjectMeta.Annotations); d != "" {
 		t.Fatalf(diff.PrintWantGot(d))
 	}
 }
@@ -7039,7 +7297,7 @@ spec:
 `),
 	}
 
-	cms := []*corev1.ConfigMap{withEnabledAlphaAPIFields(newFeatureFlagsConfigMap())}
+	cms := []*corev1.ConfigMap{newFeatureFlagsConfigMap()}
 	d := test.Data{
 		ConfigMaps:   cms,
 		PipelineRuns: prs,
@@ -8215,7 +8473,7 @@ spec:
     kind: Task
  `),
 	}
-	cms := []*corev1.ConfigMap{withEnabledAlphaAPIFields(newFeatureFlagsConfigMap())}
+	cms := []*corev1.ConfigMap{newFeatureFlagsConfigMap()}
 	cms = append(cms, withMaxMatrixCombinationsCount(newDefaultsConfigMap(), 10))
 
 	tests := []struct {
@@ -8591,8 +8849,7 @@ spec:
       script: |
         echo "$(params.platform) and $(params.browser)"
 `)
-
-	cms := []*corev1.ConfigMap{withEnabledAlphaAPIFields(newFeatureFlagsConfigMap())}
+	cms := []*corev1.ConfigMap{newFeatureFlagsConfigMap()}
 	cms = append(cms, withMaxMatrixCombinationsCount(newDefaultsConfigMap(), 10))
 
 	tests := []struct {
@@ -8976,7 +9233,7 @@ spec:
     kind: Task
 `),
 	}
-	cms := []*corev1.ConfigMap{withEnabledAlphaAPIFields(newFeatureFlagsConfigMap())}
+	cms := []*corev1.ConfigMap{newFeatureFlagsConfigMap()}
 	cms = append(cms, withMaxMatrixCombinationsCount(newDefaultsConfigMap(), 10))
 
 	tests := []struct {
@@ -9434,7 +9691,7 @@ spec:
     kind: Task
 `),
 	}
-	cms := []*corev1.ConfigMap{withEnabledAlphaAPIFields(newFeatureFlagsConfigMap())}
+	cms := []*corev1.ConfigMap{newFeatureFlagsConfigMap()}
 	cms = append(cms, withMaxMatrixCombinationsCount(newDefaultsConfigMap(), 10))
 
 	tests := []struct {
@@ -9795,7 +10052,7 @@ spec:
     kind: Task
 `),
 	}
-	cms := []*corev1.ConfigMap{withEnabledAlphaAPIFields(newFeatureFlagsConfigMap())}
+	cms := []*corev1.ConfigMap{newFeatureFlagsConfigMap()}
 	cms = append(cms, withMaxMatrixCombinationsCount(newDefaultsConfigMap(), 10))
 
 	tests := []struct {
@@ -10225,7 +10482,7 @@ spec:
         echo -n "[\"linux\",\"mac\",\"windows\"]" | tee $(results.platforms.path)
 `)
 
-	cms := []*corev1.ConfigMap{withEnabledAlphaAPIFields(newFeatureFlagsConfigMap())}
+	cms := []*corev1.ConfigMap{newFeatureFlagsConfigMap()}
 	cms = append(cms, withMaxMatrixCombinationsCount(newDefaultsConfigMap(), 10))
 	tests := []struct {
 		name                string
@@ -10768,7 +11025,8 @@ spec:
     tekton.dev/pipeline: p-dag
 `),
 	}
-	cms := []*corev1.ConfigMap{withEnabledAlphaAPIFields(newFeatureFlagsConfigMap())}
+
+	cms := []*corev1.ConfigMap{newFeatureFlagsConfigMap()}
 	cms = append(cms, withMaxMatrixCombinationsCount(newDefaultsConfigMap(), 10))
 	tests := []struct {
 		name                string
@@ -10945,7 +11203,7 @@ spec:
         exit 1
 `)
 
-	cms := []*corev1.ConfigMap{withEnabledAlphaAPIFields(newFeatureFlagsConfigMap())}
+	cms := []*corev1.ConfigMap{newFeatureFlagsConfigMap()}
 	cms = append(cms, withMaxMatrixCombinationsCount(newDefaultsConfigMap(), 10))
 
 	tests := []struct {
@@ -11567,7 +11825,7 @@ spec:
     name: mytask
 `),
 	}
-	cms := []*corev1.ConfigMap{withEnabledAlphaAPIFields(newFeatureFlagsConfigMap())}
+	cms := []*corev1.ConfigMap{newFeatureFlagsConfigMap()}
 
 	tests := []struct {
 		name                string
@@ -11929,7 +12187,7 @@ spec:
         echo -n "[\"linux\",\"mac\",\"windows\"]" | tee $(results.platforms.path)
 `)
 
-	cms := []*corev1.ConfigMap{withEnabledAlphaAPIFields(newFeatureFlagsConfigMap())}
+	cms := []*corev1.ConfigMap{newFeatureFlagsConfigMap()}
 	cms = append(cms, withMaxMatrixCombinationsCount(newDefaultsConfigMap(), 10))
 	tests := []struct {
 		name  string
@@ -12092,7 +12350,8 @@ spec:
     kind: Task
 `),
 	}
-	cms := []*corev1.ConfigMap{withEnabledAlphaAPIFields(newFeatureFlagsConfigMap())}
+
+	cms := []*corev1.ConfigMap{newFeatureFlagsConfigMap()}
 	cms = append(cms, withMaxMatrixCombinationsCount(newDefaultsConfigMap(), 10))
 
 	tests := []struct {
@@ -12340,6 +12599,1519 @@ spec:
 	}
 }
 
+func TestReconciler_PipelineTaskMatrixExplicitCombosResultsAndMatrixContextVars(t *testing.T) {
+	names.TestingSeed()
+	task1 := parse.MustParseV1Task(t, `
+metadata:
+  name: arraytask
+  namespace: foo
+spec:
+  params:
+    - name: DIGEST
+      type: array
+  steps:
+    - name: use-environments
+      image: bash:latest
+      args: ["$(params.DIGEST[*])"]
+      script: |
+        for arg in "$@"; do
+          echo "Arg: $arg"
+        done
+`)
+	task2 := parse.MustParseV1Task(t, `
+metadata:
+  name: stringtask
+  namespace: foo
+spec:
+  params:
+    - name: DIGEST
+      type: string
+  steps:
+    - name: echo
+      image: alpine
+      script: |
+         echo "$(params.DIGEST)"
+`)
+	task3 := parse.MustParseV1Task(t, `
+metadata:
+  name: echomatrixlength
+  namespace: foo
+spec:
+  params:
+    - name: matrixlength
+      type: string
+      steps:
+        - name: echo
+          image: alpine
+          script: echo $(params.matrixlength)
+`)
+	task4 := parse.MustParseV1Task(t, `
+metadata:
+  name: echomatrixresultslength
+  namespace: foo
+spec:
+  params:
+    - name: matrixresultslength
+      type: string
+      steps:
+        - name: echo
+          image: alpine
+          script: echo $(params.matrixresultslength)
+`)
+
+	taskwithresults := parse.MustParseV1Task(t, `
+metadata:
+  name: taskwithresults
+  namespace: foo
+spec:
+  params:
+    - name: IMAGE
+    - name: DIGEST
+      default: ""
+  results:
+    - name: IMAGE-DIGEST
+  steps:
+    - name: produce-results
+      image: bash:latest
+      script: |
+        #!/usr/bin/env bash
+        echo "Building image for $(params.IMAGE)"
+        echo -n "$(params.DIGEST)" | sha256sum | tee $(results.IMAGE-DIGEST.path)
+`)
+	taskRuns := []*v1.TaskRun{
+		mustParseTaskRunWithObjectMeta(t,
+			taskRunObjectMeta("pr-matrix-emitting-results-0", "foo",
+				"pr", "p", "matrix-emitting-results", false),
+			`
+spec:
+  params:
+  - name: DOCKERFILE
+    value: path/to/Dockerfile1
+  - name: IMAGE
+    value: image-1
+  serviceAccountName: test-sa
+  taskRef:
+    name: arraytask
+    kind: Task
+status:
+ conditions:
+  - type: Succeeded
+    status: "True"
+    reason: Succeeded
+    message: All Tasks have completed executing
+ results:
+  - name: IMAGE-DIGEST
+    value: 0cf457e24a479f02fd4d34540389f720f0807dcff92a7562108165b2637ea82f
+  - name: IMAGE-NAME
+    value: image-1
+`),
+		mustParseTaskRunWithObjectMeta(t,
+			taskRunObjectMeta("pr-matrix-emitting-results-1", "foo",
+				"pr", "p", "matrix-emitting-results", false),
+			`
+spec:
+  params:
+  - name: DOCKERFILE
+    value: path/to/Dockerfile2
+  - name: IMAGE
+    value: image-2
+  serviceAccountName: test-sa
+  taskRef:
+    name: arraytask
+    kind: Task
+status:
+ conditions:
+  - type: Succeeded
+    status: "True"
+    reason: Succeeded
+    message: All Tasks have completed executing
+ results:
+  - name: IMAGE-DIGEST
+    value: 5a0717cb6596468ea1dffa86011f9b0f497348d80421835b51799f9aeb455642
+  - name: IMAGE-NAME
+    value: image-2
+`),
+		mustParseTaskRunWithObjectMeta(t,
+			taskRunObjectMeta("pr-matrix-emitting-results-2", "foo",
+				"pr", "p", "matrix-emitting-results", false),
+			`
+spec:
+  params:
+  - name: DOCKERFILE
+    value: path/to/Dockerfile3
+  - name: IMAGE
+    value: image-3
+  serviceAccountName: test-sa
+  taskRef:
+    name: arraytask
+    kind: Task
+status:
+ conditions:
+  - type: Succeeded
+    status: "True"
+    reason: Succeeded
+    message: All Tasks have completed executing
+ results:
+  - name: IMAGE-DIGEST
+    value: d9f313aef2d97e58def0511fdc17512d53e6b30d578860ae04b5288c6a239010
+  - name: IMAGE-NAME
+    value: image-3
+`),
+	}
+	cms := []*corev1.ConfigMap{withEnabledAlphaAPIFields(newFeatureFlagsConfigMap())}
+	cms = append(cms, withMaxMatrixCombinationsCount(newDefaultsConfigMap(), 10))
+	tests := []struct {
+		name                string
+		memberOf            string
+		p                   *v1.Pipeline
+		expectedTaskRuns    []*v1.TaskRun
+		expectedPipelineRun *v1.PipelineRun
+	}{{
+		name:     "p-consuming-results",
+		memberOf: "tasks",
+		p: parse.MustParseV1Pipeline(t, fmt.Sprintf(`
+metadata:
+  name: %s
+  namespace: foo
+spec:
+  tasks:
+    - name: matrix-emitting-results
+      matrix:
+        include:
+          - name: build-1
+            params:
+              - name: IMAGE
+                value: image-1
+              - name: DOCKERFILE
+                value: path/to/Dockerfile1
+          - name: build-2
+            params:
+              - name: IMAGE
+                value: image-2
+              - name: DOCKERFILE
+                value: path/to/Dockerfile2
+          - name: build-3
+            params:
+              - name: IMAGE
+                value: image-3
+              - name: DOCKERFILE
+                value: path/to/Dockerfile3
+      taskRef:
+        name: taskwithresults
+        kind: Task
+    - name: task-consuming-results
+      taskRef:
+        name: arraytask
+        kind: Task
+      params:
+        - name: NAME
+          value: $(tasks.matrix-emitting-results.results.IMAGE-NAME[*])
+        - name: DIGEST
+          value: $(tasks.matrix-emitting-results.results.IMAGE-DIGEST[*])
+    - name: matrix-task-consuming-results
+      taskRef:
+        name: stringtask
+        kind: Task
+      matrix:
+        params:
+          - name: DIGEST
+            value: $(tasks.matrix-emitting-results.results.IMAGE-DIGEST[*])
+`, "p-consuming-results")),
+		expectedTaskRuns: []*v1.TaskRun{
+			mustParseTaskRunWithObjectMeta(t,
+				taskRunObjectMeta("pr-matrix-task-consuming-results-0", "foo",
+					"pr", "p", "matrix-task-consuming-results", false),
+				`
+spec:
+  params:
+  - name: DIGEST
+    value: 0cf457e24a479f02fd4d34540389f720f0807dcff92a7562108165b2637ea82f
+  serviceAccountName: test-sa
+  taskRef:
+    name: stringtask
+    kind: Task
+`),
+			mustParseTaskRunWithObjectMeta(t,
+				taskRunObjectMeta("pr-matrix-task-consuming-results-1", "foo",
+					"pr", "p", "matrix-task-consuming-results", false),
+				`
+spec:
+  params:
+  - name: DIGEST
+    value: 5a0717cb6596468ea1dffa86011f9b0f497348d80421835b51799f9aeb455642
+  serviceAccountName: test-sa
+  taskRef:
+    name: stringtask
+    kind: Task
+`),
+			mustParseTaskRunWithObjectMeta(t,
+				taskRunObjectMeta("pr-matrix-task-consuming-results-2", "foo",
+					"pr", "p", "matrix-task-consuming-results", false),
+				`
+spec:
+  params:
+  - name: DIGEST
+    value: d9f313aef2d97e58def0511fdc17512d53e6b30d578860ae04b5288c6a239010
+  serviceAccountName: test-sa
+  taskRef:
+    name: stringtask
+    kind: Task
+`),
+			mustParseTaskRunWithObjectMeta(t,
+				taskRunObjectMeta("pr-task-consuming-results", "foo",
+					"pr", "p", "task-consuming-results", false),
+				`
+spec:
+  params:
+  - name: NAME
+    value:
+      - image-1
+      - image-2
+      - image-3
+  - name: DIGEST
+    value:
+      - 0cf457e24a479f02fd4d34540389f720f0807dcff92a7562108165b2637ea82f
+      - 5a0717cb6596468ea1dffa86011f9b0f497348d80421835b51799f9aeb455642
+      - d9f313aef2d97e58def0511fdc17512d53e6b30d578860ae04b5288c6a239010
+  serviceAccountName: test-sa
+  taskRef:
+    name: arraytask
+    kind: Task
+`),
+		},
+		expectedPipelineRun: parse.MustParseV1PipelineRun(t, `
+metadata:
+  name: pr
+  namespace: foo
+  annotations: {}
+  labels:
+    tekton.dev/pipeline: p-consuming-results
+spec:
+  taskRunTemplate:
+    serviceAccountName: test-sa
+  pipelineRef:
+    name: p-consuming-results
+status:
+  pipelineSpec:
+    tasks:
+    - name: matrix-emitting-results
+      matrix:
+        include:
+        - name: build-1
+          params:
+          - name: IMAGE
+            value: image-1
+          - name: DOCKERFILE
+            value: path/to/Dockerfile1
+        - name: build-2
+          params:
+          - name: IMAGE
+            value: image-2
+          - name: DOCKERFILE
+            value: path/to/Dockerfile2
+        - name: build-3
+          params:
+          - name: IMAGE
+            value: image-3
+          - name: DOCKERFILE
+            value: path/to/Dockerfile3
+      taskRef:
+        kind: Task
+        name: taskwithresults
+    - name: task-consuming-results
+      taskRef:
+        name: arraytask
+        kind: Task
+      params:
+        - name: NAME
+          value: $(tasks.matrix-emitting-results.results.IMAGE-NAME[*])
+        - name: DIGEST
+          value: $(tasks.matrix-emitting-results.results.IMAGE-DIGEST[*])
+    - name: matrix-task-consuming-results
+      taskRef:
+        name: stringtask
+        kind: Task
+      matrix:
+        params:
+          - name: DIGEST
+            value: $(tasks.matrix-emitting-results.results.IMAGE-DIGEST[*])
+  conditions:
+  - type: Succeeded
+    status: "Unknown"
+    reason: "Running"
+    message: "Tasks Completed: 1 (Failed: 0, Cancelled 0), Incomplete: 2, Skipped: 0"
+  childReferences:
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-emitting-results-0
+    pipelineTaskName: matrix-emitting-results
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-emitting-results-1
+    pipelineTaskName: matrix-emitting-results
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-emitting-results-2
+    pipelineTaskName: matrix-emitting-results
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-task-consuming-results-0
+    pipelineTaskName: matrix-task-consuming-results
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-task-consuming-results-1
+    pipelineTaskName: matrix-task-consuming-results
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-task-consuming-results-2
+    pipelineTaskName: matrix-task-consuming-results
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-task-consuming-results
+    pipelineTaskName: task-consuming-results
+`),
+	}, {
+		name:     "p-matrix-context-vars",
+		memberOf: "tasks",
+		p: parse.MustParseV1Pipeline(t, fmt.Sprintf(`
+metadata:
+  name: %s
+  namespace: foo
+spec:
+  tasks:
+    - name: matrix-emitting-results
+      matrix:
+        include:
+          - name: build-1
+            params:
+              - name: IMAGE
+                value: image-1
+              - name: DOCKERFILE
+                value: path/to/Dockerfile1
+          - name: build-2
+            params:
+              - name: IMAGE
+                value: image-2
+              - name: DOCKERFILE
+                value: path/to/Dockerfile2
+          - name: build-3
+            params:
+              - name: IMAGE
+                value: image-3
+              - name: DOCKERFILE
+                value: path/to/Dockerfile3
+      taskRef:
+        name: taskwithresults
+        kind: Task
+    - name: matrixed-echo-length
+      params:
+       - name: matrixlength
+         value: $(tasks.matrix-emitting-results.matrix.length)
+      taskRef:
+        name: echomatrixlength
+        kind: Task
+    - name: matrixed-echo-results-length
+      params:
+        - name: matrixresultslength
+          value: $(tasks.matrix-emitting-results.matrix.IMAGE-DIGEST.length)
+      taskRef:
+        name: echomatrixresultslength
+        kind: Task
+`, "p-matrix-context-vars")),
+		expectedTaskRuns: []*v1.TaskRun{
+			mustParseTaskRunWithObjectMeta(t,
+				taskRunObjectMeta("pr-matrixed-echo-length", "foo",
+					"pr", "p", "matrixed-echo-length", false),
+				`
+spec:
+  params:
+  - name: matrixlength
+    value: 3
+  serviceAccountName: test-sa
+  taskRef:
+    name: echomatrixlength
+    kind: Task
+`),
+			mustParseTaskRunWithObjectMeta(t,
+				taskRunObjectMeta("pr-matrixed-echo-results-length", "foo",
+					"pr", "p", "matrixed-echo-results-length", false),
+				`
+spec:
+  params:
+  - name: matrixresultslength
+    value: 3
+  serviceAccountName: test-sa
+  taskRef:
+    name: echomatrixresultslength
+    kind: Task
+`),
+		},
+		expectedPipelineRun: parse.MustParseV1PipelineRun(t, `
+metadata:
+  name: pr
+  namespace: foo
+  annotations: {}
+  labels:
+    tekton.dev/pipeline: p-matrix-context-vars
+spec:
+  taskRunTemplate:
+    serviceAccountName: test-sa
+  pipelineRef:
+    name: p-matrix-context-vars
+status:
+  pipelineSpec:
+    tasks:
+    - name: matrix-emitting-results
+      matrix:
+        include:
+        - name: build-1
+          params:
+          - name: IMAGE
+            value: image-1
+          - name: DOCKERFILE
+            value: path/to/Dockerfile1
+        - name: build-2
+          params:
+          - name: IMAGE
+            value: image-2
+          - name: DOCKERFILE
+            value: path/to/Dockerfile2
+        - name: build-3
+          params:
+          - name: IMAGE
+            value: image-3
+          - name: DOCKERFILE
+            value: path/to/Dockerfile3
+      taskRef:
+        kind: Task
+        name: taskwithresults
+    - name: matrixed-echo-length
+      params:
+       - name: matrixlength
+         value: $(tasks.matrix-emitting-results.matrix.length)
+      taskRef:
+        name: echomatrixlength
+        kind: Task
+    - name: matrixed-echo-results-length
+      params:
+        - name: matrixresultslength
+          value: $(tasks.matrix-emitting-results.matrix.IMAGE-DIGEST.length)
+      taskRef:
+        name: echomatrixresultslength
+        kind: Task
+  conditions:
+  - type: Succeeded
+    status: "Unknown"
+    reason: "Running"
+    message: "Tasks Completed: 1 (Failed: 0, Cancelled 0), Incomplete: 2, Skipped: 0"
+  childReferences:
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-emitting-results-0
+    pipelineTaskName: matrix-emitting-results
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-emitting-results-1
+    pipelineTaskName: matrix-emitting-results
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-emitting-results-2
+    pipelineTaskName: matrix-emitting-results
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrixed-echo-length
+    pipelineTaskName: matrixed-echo-length
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrixed-echo-results-length
+    pipelineTaskName: matrixed-echo-results-length
+`),
+	}, {
+		name:     "p-finally",
+		memberOf: "finally",
+		p: parse.MustParseV1Pipeline(t, fmt.Sprintf(`
+metadata:
+  name: %s
+  namespace: foo
+spec:
+  tasks:
+    - name: matrix-emitting-results
+      matrix:
+        include:
+          - name: build-1
+            params:
+              - name: IMAGE
+                value: image-1
+              - name: DOCKERFILE
+                value: path/to/Dockerfile1
+          - name: build-2
+            params:
+              - name: IMAGE
+                value: image-2
+              - name: DOCKERFILE
+                value: path/to/Dockerfile2
+          - name: build-3
+            params:
+              - name: IMAGE
+                value: image-3
+              - name: DOCKERFILE
+                value: path/to/Dockerfile3
+      taskRef:
+        name: taskwithresults
+        kind: Task
+  finally:
+    - name: matrixed-echo-length
+      params:
+       - name: matrixlength
+         value: $(tasks.matrix-emitting-results.matrix.length)
+      taskRef:
+        name: echomatrixlength
+        kind: Task
+    - name: matrixed-echo-results-length
+      params:
+        - name: matrixresultslength
+          value: $(tasks.matrix-emitting-results.matrix.IMAGE-DIGEST.length)
+      taskRef:
+        name: echomatrixresultslength
+        kind: Task
+`, "p-finally")),
+
+		expectedTaskRuns: []*v1.TaskRun{
+			mustParseTaskRunWithObjectMeta(t,
+				taskRunObjectMeta("pr-matrixed-echo-length", "foo",
+					"pr", "p-finally", "matrixed-echo-length", false),
+				`
+spec:
+  params:
+  - name: matrixlength
+    value: 3
+  serviceAccountName: test-sa
+  taskRef:
+    name: echomatrixlength
+    kind: Task
+`),
+			mustParseTaskRunWithObjectMeta(t,
+				taskRunObjectMeta("pr-matrixed-echo-results-length", "foo",
+					"pr", "p-finally", "matrixed-echo-results-length", false),
+				`
+spec:
+  params:
+  - name: matrixresultslength
+    value: 3
+  serviceAccountName: test-sa
+  taskRef:
+    name: echomatrixresultslength
+    kind: Task
+`),
+		},
+		expectedPipelineRun: parse.MustParseV1PipelineRun(t, `
+metadata:
+  name: pr
+  namespace: foo
+  annotations: {}
+  labels:
+    tekton.dev/pipeline: p-finally
+spec:
+  taskRunTemplate:
+    serviceAccountName: test-sa
+  pipelineRef:
+    name: p-finally
+status:
+  pipelineSpec:
+    tasks:
+    - name: matrix-emitting-results
+      matrix:
+        include:
+          - name: build-1
+            params:
+              - name: IMAGE
+                value: image-1
+              - name: DOCKERFILE
+                value: path/to/Dockerfile1
+          - name: build-2
+            params:
+              - name: IMAGE
+                value: image-2
+              - name: DOCKERFILE
+                value: path/to/Dockerfile2
+          - name: build-3
+            params:
+              - name: IMAGE
+                value: image-3
+              - name: DOCKERFILE
+                value: path/to/Dockerfile3
+      taskRef:
+        name: taskwithresults
+        kind: Task
+    finally:
+    - name: matrixed-echo-length
+      params:
+       - name: matrixlength
+         value: $(tasks.matrix-emitting-results.matrix.length)
+      taskRef:
+        name: echomatrixlength
+        kind: Task
+    - name: matrixed-echo-results-length
+      params:
+        - name: matrixresultslength
+          value: $(tasks.matrix-emitting-results.matrix.IMAGE-DIGEST.length)
+      taskRef:
+        name: echomatrixresultslength
+        kind: Task
+  conditions:
+  - type: Succeeded
+    status: "Unknown"
+    reason: "Running"
+    message: "Tasks Completed: 1 (Failed: 0, Cancelled 0), Incomplete: 2, Skipped: 0"
+  childReferences:
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-emitting-results-0
+    pipelineTaskName: matrix-emitting-results
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-emitting-results-1
+    pipelineTaskName: matrix-emitting-results
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-emitting-results-2
+    pipelineTaskName: matrix-emitting-results
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrixed-echo-length
+    pipelineTaskName: matrixed-echo-length
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrixed-echo-results-length
+    pipelineTaskName: matrixed-echo-results-length
+`),
+	}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pr := parse.MustParseV1PipelineRun(t, fmt.Sprintf(`
+metadata:
+  name: pr
+  namespace: foo
+spec:
+  taskRunTemplate:
+    serviceAccountName: test-sa
+  pipelineRef:
+    name: %s
+`, tt.name))
+			d := test.Data{
+				PipelineRuns: []*v1.PipelineRun{pr},
+				Pipelines:    []*v1.Pipeline{tt.p},
+				Tasks:        []*v1.Task{task1, task2, task3, task4, taskwithresults},
+				TaskRuns:     taskRuns,
+				ConfigMaps:   cms,
+			}
+			prt := newPipelineRunTest(t, d)
+			defer prt.Cancel()
+			_, clients := prt.reconcileRun("foo", "pr", []string{}, false)
+			taskRuns, err := clients.Pipeline.TektonV1().TaskRuns("foo").List(prt.TestAssets.Ctx, metav1.ListOptions{
+				LabelSelector: fmt.Sprintf("tekton.dev/pipelineRun=pr,tekton.dev/pipeline=%s", tt.name),
+				Limit:         1,
+			})
+			if err != nil {
+				t.Fatalf("Failure to list TaskRun's %s", err)
+			}
+			if len(taskRuns.Items) != len(tt.expectedTaskRuns) {
+				t.Fatalf("Expected %d TaskRuns got %d", len(tt.expectedTaskRuns), len(taskRuns.Items))
+			}
+			for i := range taskRuns.Items {
+				expectedTaskRun := tt.expectedTaskRuns[i]
+				expectedTaskRun.Labels["tekton.dev/pipeline"] = tt.name
+				expectedTaskRun.Labels["tekton.dev/memberOf"] = tt.memberOf
+				if d := cmp.Diff(expectedTaskRun, &taskRuns.Items[i], ignoreResourceVersion, ignoreTypeMeta); d != "" {
+					t.Errorf("expected to see TaskRun %v created. Diff %s", tt.expectedTaskRuns[i].Name, diff.PrintWantGot(d))
+				}
+			}
+			pipelineRun, err := clients.Pipeline.TektonV1().PipelineRuns("foo").Get(prt.TestAssets.Ctx, "pr", metav1.GetOptions{})
+			if err != nil {
+				t.Fatalf("Got an error getting reconciled run out of fake client: %s", err)
+			}
+			if d := cmp.Diff(tt.expectedPipelineRun, pipelineRun, ignoreResourceVersion, ignoreTypeMeta, ignoreLastTransitionTime, ignoreStartTime, ignoreFinallyStartTime, ignoreProvenance, cmpopts.EquateEmpty(), cmpopts.SortSlices(lessChildReferences)); d != "" {
+				t.Errorf("expected PipelineRun was not created. Diff %s", diff.PrintWantGot(d))
+			}
+		})
+	}
+}
+
+func TestReconciler_PipelineTaskMatrixConsumingResults(t *testing.T) {
+	names.TestingSeed()
+	task1 := parse.MustParseV1Task(t, `
+metadata:
+  name: arraytask
+  namespace: foo
+spec:
+  params:
+    - name: result
+      type: array
+  steps:
+    - name: echo
+      image: alpine
+      script: |
+        echo "$(params.result)"
+`)
+
+	task2 := parse.MustParseV1Task(t, `
+metadata:
+  name: stringtask
+  namespace: foo
+spec:
+  params:
+    - name: result
+      type: string
+  steps:
+    - name: echo
+      image: alpine
+      script: |
+        echo "$(params.result)"
+`)
+	taskwithresults := parse.MustParseV1Task(t, `
+metadata:
+  name: taskwithresults
+  namespace: foo
+spec:
+  params:
+   - name: platform
+     default: ""
+   - name: browser
+     default: ""
+  results:
+   - name: report-url
+     type: string
+  steps:
+    - name: produce-results
+      image: alpine
+      script: |
+        #!/usr/bin/env bash
+        echo "https://api.example/get-report/$(params.platform)-$(params.browser)" | tee $(results.report-url.path)
+`)
+	trs := []*v1.TaskRun{
+		mustParseTaskRunWithObjectMeta(t,
+			taskRunObjectMeta("pr-matrix-emitting-results-0", "foo",
+				"pr", "p", "matrix-emitting-results", false),
+			`
+spec:
+  params:
+  - name: result
+    value: https://api.example/get-report/linux-chrome
+  serviceAccountName: test-sa
+  taskRef:
+    name: arraytask
+    kind: Task
+status:
+ conditions:
+  - type: Succeeded
+    status: "True"
+    reason: Succeeded
+    message: All Tasks have completed executing
+ results:
+  - name: report-url
+    value: https://api.example/get-report/linux-chrome
+`),
+		mustParseTaskRunWithObjectMeta(t,
+			taskRunObjectMeta("pr-matrix-emitting-results-1", "foo",
+				"pr", "p", "matrix-emitting-results", false),
+			`
+spec:
+  params:
+  - name: result
+    value: https://api.example/get-report/mac-chrome
+  serviceAccountName: test-sa
+  taskRef:
+    name: arraytask
+    kind: Task
+status:
+ conditions:
+  - type: Succeeded
+    status: "True"
+    reason: Succeeded
+    message: All Tasks have completed executing
+ results:
+  - name: report-url
+    value: https://api.example/get-report/mac-chrome
+`),
+		mustParseTaskRunWithObjectMeta(t,
+			taskRunObjectMeta("pr-matrix-emitting-results-2", "foo",
+				"pr", "p", "matrix-emitting-results", false),
+			`
+spec:
+  params:
+  - name: result
+    value: https://api.example/get-report/linux-safari
+  serviceAccountName: test-sa
+  taskRef:
+    name: arraytask
+    kind: Task
+status:
+  conditions:
+  - type: Succeeded
+    status: "True"
+    reason: Succeeded
+    message: All Tasks have completed executing
+  results:
+  - name: report-url
+    value: https://api.example/get-report/linux-safari
+`),
+		mustParseTaskRunWithObjectMeta(t,
+			taskRunObjectMeta("pr-matrix-emitting-results-3", "foo",
+				"pr", "p", "matrix-emitting-results", false),
+			`
+spec:
+  params:
+  - name: result
+    value: https://api.example/get-report/mac-safari
+  serviceAccountName: test-sa
+  taskRef:
+    name: arraytask
+    kind: Task
+status:
+  conditions:
+  - type: Succeeded
+    status: "True"
+    reason: Succeeded
+    message: All Tasks have completed executing
+  results:
+  - name: report-url
+    value: https://api.example/get-report/mac-safari
+`),
+	}
+	cms := []*corev1.ConfigMap{withEnabledAlphaAPIFields(newFeatureFlagsConfigMap())}
+	cms = append(cms, withMaxMatrixCombinationsCount(newDefaultsConfigMap(), 10))
+	tests := []struct {
+		name                string
+		memberOf            string
+		p                   *v1.Pipeline
+		expectedTaskRuns    []*v1.TaskRun
+		expectedPipelineRun *v1.PipelineRun
+		expectedCustomRuns  []*v1beta1.CustomRun
+	}{{
+		name:     "p-task-consuming-results",
+		memberOf: "tasks",
+		p: parse.MustParseV1Pipeline(t, fmt.Sprintf(`
+metadata:
+  name: %s
+  namespace: foo
+spec:
+  tasks:
+    - name: matrix-emitting-results
+      matrix:
+        params:
+          - name: platform
+            value:
+              - linux
+              - mac
+          - name: browser
+            value:
+              - chrome
+              - safari
+      taskRef:
+        name: taskwithresults
+        kind: Task
+    - name: task-consuming-results
+      taskRef:
+        name: arraytask
+        kind: Task
+      params:
+        - name: result
+          value: $(tasks.matrix-emitting-results.results.report-url[*])
+`, "p-task-consuming-results")),
+		expectedTaskRuns: []*v1.TaskRun{
+			mustParseTaskRunWithObjectMeta(t,
+				taskRunObjectMeta("pr-task-consuming-results", "foo",
+					"pr", "p", "task-consuming-results", false),
+				`
+spec:
+  params:
+  - name: result
+    value:
+      - https://api.example/get-report/linux-chrome
+      - https://api.example/get-report/mac-chrome
+      - https://api.example/get-report/linux-safari
+      - https://api.example/get-report/mac-safari
+  serviceAccountName: test-sa
+  taskRef:
+    name: arraytask
+    kind: Task
+`),
+		},
+		expectedPipelineRun: parse.MustParseV1PipelineRun(t, `
+metadata:
+  name: pr
+  namespace: foo
+  annotations: {}
+  labels:
+    tekton.dev/pipeline: p-task-consuming-results
+spec:
+  taskRunTemplate:
+    serviceAccountName: test-sa
+  pipelineRef:
+    name: p-task-consuming-results
+status:
+  pipelineSpec:
+    tasks:
+    - name: matrix-emitting-results
+      matrix:
+        params:
+          - name: platform
+            value:
+              - linux
+              - mac
+          - name: browser
+            value:
+              - chrome
+              - safari
+      taskRef:
+        name: taskwithresults
+        kind: Task
+    - name: task-consuming-results
+      taskRef:
+        name: arraytask
+        kind: Task
+      params:
+        - name: result
+          value: $(tasks.matrix-emitting-results.results.report-url[*])
+  conditions:
+  - type: Succeeded
+    status: "Unknown"
+    reason: "Running"
+    message: "Tasks Completed: 1 (Failed: 0, Cancelled 0), Incomplete: 1, Skipped: 0"
+  childReferences:
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-emitting-results-0
+    pipelineTaskName: matrix-emitting-results
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-emitting-results-1
+    pipelineTaskName: matrix-emitting-results
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-emitting-results-2
+    pipelineTaskName: matrix-emitting-results
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-emitting-results-3
+    pipelineTaskName: matrix-emitting-results
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-task-consuming-results
+    pipelineTaskName: task-consuming-results
+`),
+	}, {
+		name:     "p-matrix-consuming-results",
+		memberOf: "tasks",
+		p: parse.MustParseV1Pipeline(t, fmt.Sprintf(`
+metadata:
+  name: %s
+  namespace: foo
+spec:
+  tasks:
+    - name: matrix-emitting-results
+      matrix:
+        params:
+          - name: platform
+            value:
+              - linux
+              - mac
+          - name: browser
+            value:
+              - chrome
+              - safari
+      taskRef:
+        name: taskwithresults
+        kind: Task
+    - name: matrix-consuming-results
+      taskRef:
+        name: stringtask
+        kind: Task
+      matrix:
+        params:
+          - name: result
+            value: $(tasks.matrix-emitting-results.results.report-url[*])
+`, "p-matrix-consuming-results")),
+		expectedTaskRuns: []*v1.TaskRun{
+			mustParseTaskRunWithObjectMeta(t,
+				taskRunObjectMeta("pr-matrix-consuming-results-0", "foo",
+					"pr", "p", "matrix-consuming-results", false),
+				`
+spec:
+  params:
+    - name: result
+      value: https://api.example/get-report/linux-chrome
+  serviceAccountName: test-sa
+  taskRef:
+    name: stringtask
+    kind: Task
+`),
+			mustParseTaskRunWithObjectMeta(t,
+				taskRunObjectMeta("pr-matrix-consuming-results-1", "foo",
+					"pr", "p", "matrix-consuming-results", false),
+				`
+spec:
+  params:
+    - name: result
+      value: https://api.example/get-report/mac-chrome
+  serviceAccountName: test-sa
+  taskRef:
+    name: stringtask
+    kind: Task
+`),
+			mustParseTaskRunWithObjectMeta(t,
+				taskRunObjectMeta("pr-matrix-consuming-results-2", "foo",
+					"pr", "p", "matrix-consuming-results", false),
+				`
+spec:
+  params:
+    - name: result
+      value: https://api.example/get-report/linux-safari
+  serviceAccountName: test-sa
+  taskRef:
+    name: stringtask
+    kind: Task
+`),
+			mustParseTaskRunWithObjectMeta(t,
+				taskRunObjectMeta("pr-matrix-consuming-results-3", "foo",
+					"pr", "p", "matrix-consuming-results", false),
+				`
+spec:
+  params:
+    - name: result
+      value: https://api.example/get-report/mac-safari
+  serviceAccountName: test-sa
+  taskRef:
+    name: stringtask
+    kind: Task
+`),
+		},
+		expectedPipelineRun: parse.MustParseV1PipelineRun(t, `
+metadata:
+  name: pr
+  namespace: foo
+  annotations: {}
+  labels:
+    tekton.dev/pipeline: p-matrix-consuming-results
+spec:
+  taskRunTemplate:
+    serviceAccountName: test-sa
+  pipelineRef:
+    name: p-matrix-consuming-results
+status:
+  pipelineSpec:
+    tasks:
+    - name: matrix-emitting-results
+      matrix:
+        params:
+          - name: platform
+            value:
+              - linux
+              - mac
+          - name: browser
+            value:
+              - chrome
+              - safari
+      taskRef:
+        name: taskwithresults
+        kind: Task
+    - name: matrix-consuming-results
+      taskRef:
+        name: stringtask
+        kind: Task
+      matrix:
+        params:
+          - name: result
+            value: $(tasks.matrix-emitting-results.results.report-url[*])
+  conditions:
+  - type: Succeeded
+    status: "Unknown"
+    reason: "Running"
+    message: "Tasks Completed: 1 (Failed: 0, Cancelled 0), Incomplete: 1, Skipped: 0"
+  childReferences:
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-emitting-results-0
+    pipelineTaskName: matrix-emitting-results
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-emitting-results-1
+    pipelineTaskName: matrix-emitting-results
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-emitting-results-2
+    pipelineTaskName: matrix-emitting-results
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-emitting-results-3
+    pipelineTaskName: matrix-emitting-results
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-consuming-results-0
+    pipelineTaskName: matrix-consuming-results
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-consuming-results-1
+    pipelineTaskName: matrix-consuming-results
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-consuming-results-2
+    pipelineTaskName: matrix-consuming-results
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-consuming-results-3
+    pipelineTaskName: matrix-consuming-results
+`),
+	}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pr := parse.MustParseV1PipelineRun(t, fmt.Sprintf(`
+metadata:
+  name: pr
+  namespace: foo
+spec:
+  taskRunTemplate:
+    serviceAccountName: test-sa
+  pipelineRef:
+    name: %s
+`, tt.name))
+			d := test.Data{
+				PipelineRuns: []*v1.PipelineRun{pr},
+				Pipelines:    []*v1.Pipeline{tt.p},
+				Tasks:        []*v1.Task{task1, task2, taskwithresults},
+				TaskRuns:     trs,
+				ConfigMaps:   cms,
+			}
+			prt := newPipelineRunTest(t, d)
+			defer prt.Cancel()
+			_, clients := prt.reconcileRun("foo", "pr", []string{}, false)
+			taskRuns, err := clients.Pipeline.TektonV1().TaskRuns("foo").List(prt.TestAssets.Ctx, metav1.ListOptions{
+				LabelSelector: fmt.Sprintf("tekton.dev/pipelineRun=pr,tekton.dev/pipeline=%s", tt.name),
+				Limit:         1,
+			})
+			if err != nil {
+				t.Fatalf("Failure to list TaskRun's %s", err)
+			}
+			if len(taskRuns.Items) != len(tt.expectedTaskRuns) {
+				t.Fatalf("Expected %d TaskRuns got %d", len(tt.expectedTaskRuns), len(taskRuns.Items))
+			}
+			for i := range taskRuns.Items {
+				expectedTaskRun := tt.expectedTaskRuns[i]
+				expectedTaskRun.Labels["tekton.dev/pipeline"] = tt.name
+				expectedTaskRun.Labels["tekton.dev/memberOf"] = tt.memberOf
+				if d := cmp.Diff(expectedTaskRun, &taskRuns.Items[i], ignoreResourceVersion, ignoreTypeMeta); d != "" {
+					t.Errorf("expected to see TaskRun %v created. Diff %s", tt.expectedTaskRuns[i].Name, diff.PrintWantGot(d))
+				}
+			}
+			pipelineRun, err := clients.Pipeline.TektonV1().PipelineRuns("foo").Get(prt.TestAssets.Ctx, "pr", metav1.GetOptions{})
+			if err != nil {
+				t.Fatalf("Got an error getting reconciled run out of fake client: %s", err)
+			}
+			if d := cmp.Diff(tt.expectedPipelineRun, pipelineRun, ignoreResourceVersion, ignoreTypeMeta, ignoreLastTransitionTime, ignoreStartTime, ignoreFinallyStartTime, ignoreProvenance, cmpopts.EquateEmpty()); d != "" {
+				t.Errorf("expected PipelineRun was not created. Diff %s", diff.PrintWantGot(d))
+			}
+		})
+	}
+}
+
+func TestReconciler_CustomTaskMatrixConsumingResults(t *testing.T) {
+	names.TestingSeed()
+	task1 := parse.MustParseV1Task(t, `
+metadata:
+  name: arraytask
+  namespace: foo
+spec:
+  params:
+    - name: result
+      type: array
+  steps:
+    - name: echo
+      image: alpine
+      script: |
+        echo "$(params.result)"
+`)
+
+	taskwithresults := parse.MustParseV1Task(t, `
+metadata:
+  name: taskwithresults
+  namespace: foo
+spec:
+  params:
+   - name: platform
+     default: ""
+   - name: browser
+     default: ""
+  results:
+   - name: report-url
+     type: string
+  steps:
+    - name: produce-results
+      image: alpine
+      script: |
+        #!/usr/bin/env bash
+        echo "https://api.example/get-report/$(params.platform)-$(params.browser)" | tee $(results.report-url.path)
+`)
+
+	expectedCustomRuns := []*v1beta1.CustomRun{
+		mustParseCustomRunWithObjectMeta(t,
+			taskRunObjectMeta("pr-task-consuming-results", "foo",
+				"pr", "p-task-consuming-results", "task-consuming-results", false),
+			`
+spec:
+  customRef:
+    apiVersion: example.dev/v0
+    kind: Example
+  params:
+  - name: result
+    value:
+      - https://api.example/get-report/linux-chrome
+      - https://api.example/get-report/mac-chrome
+      - https://api.example/get-report/linux-safari
+      - https://api.example/get-report/mac-safari
+  serviceAccountName: test-sa
+  taskRef:
+    name: arraytask
+    kind: Task
+`),
+	}
+	cms := []*corev1.ConfigMap{withEnabledAlphaAPIFields(newFeatureFlagsConfigMap())}
+	cms = append(cms, withMaxMatrixCombinationsCount(newDefaultsConfigMap(), 10))
+	tests := []struct {
+		name                string
+		memberOf            string
+		p                   *v1.Pipeline
+		trs                 []*v1.TaskRun
+		expectedPipelineRun *v1.PipelineRun
+	}{{
+		name:     "p-task-consuming-results",
+		memberOf: "tasks",
+		p: parse.MustParseV1Pipeline(t, fmt.Sprintf(`
+metadata:
+  name: %s
+  namespace: foo
+spec:
+  tasks:
+    - name: matrix-emitting-results
+      matrix:
+        params:
+          - name: platform
+            value:
+              - linux
+              - mac
+          - name: browser
+            value:
+              - chrome
+              - safari
+      taskRef:
+        name: taskwithresults
+        kind: Task
+    - name: task-consuming-results
+      params:
+        - name: result
+          value: $(tasks.matrix-emitting-results.results.report-url[*])
+      taskRef:
+        apiVersion: example.dev/v0
+        kind: Example
+`, "p-task-consuming-results")),
+		trs: []*v1.TaskRun{
+			mustParseTaskRunWithObjectMeta(t,
+				taskRunObjectMeta("pr-matrix-emitting-results-0", "foo",
+					"pr", "p-task-consuming-results", "matrix-emitting-results", false),
+				`
+spec:
+  params:
+  - name: result
+    value: https://api.example/get-report/linux-chrome
+  serviceAccountName: test-sa
+  taskRef:
+    name: arraytask
+    kind: Task
+status:
+ conditions:
+  - type: Succeeded
+    status: "True"
+    reason: Succeeded
+    message: All Tasks have completed executing
+ results:
+  - name: report-url
+    value: https://api.example/get-report/linux-chrome
+`),
+			mustParseTaskRunWithObjectMeta(t,
+				taskRunObjectMeta("pr-matrix-emitting-results-1", "foo",
+					"pr", "p-task-consuming-results", "matrix-emitting-results", false),
+				`
+spec:
+  params:
+  - name: result
+    value: https://api.example/get-report/mac-chrome
+  serviceAccountName: test-sa
+  taskRef:
+    name: arraytask
+    kind: Task
+status:
+ conditions:
+  - type: Succeeded
+    status: "True"
+    reason: Succeeded
+    message: All Tasks have completed executing
+ results:
+  - name: report-url
+    value: https://api.example/get-report/mac-chrome
+`),
+			mustParseTaskRunWithObjectMeta(t,
+				taskRunObjectMeta("pr-matrix-emitting-results-2", "foo",
+					"pr", "p-task-consuming-results", "matrix-emitting-results", false),
+				`
+spec:
+  params:
+  - name: result
+    value: https://api.example/get-report/linux-safari
+  serviceAccountName: test-sa
+  taskRef:
+    name: arraytask
+    kind: Task
+status:
+  conditions:
+  - type: Succeeded
+    status: "True"
+    reason: Succeeded
+    message: All Tasks have completed executing
+  results:
+  - name: report-url
+    value: https://api.example/get-report/linux-safari
+`),
+			mustParseTaskRunWithObjectMeta(t,
+				taskRunObjectMeta("pr-matrix-emitting-results-3", "foo",
+					"pr", "p-task-consuming-results", "matrix-emitting-results", false),
+				`
+spec:
+  params:
+  - name: result
+    value: https://api.example/get-report/mac-safari
+  serviceAccountName: test-sa
+  taskRef:
+    name: arraytask
+    kind: Task
+status:
+  conditions:
+  - type: Succeeded
+    status: "True"
+    reason: Succeeded
+    message: All Tasks have completed executing
+  results:
+  - name: report-url
+    value: https://api.example/get-report/mac-safari
+`),
+		},
+		expectedPipelineRun: parse.MustParseV1PipelineRun(t, `
+metadata:
+  name: pr
+  namespace: foo
+  annotations: {}
+  labels:
+    tekton.dev/pipeline: p-task-consuming-results
+spec:
+  taskRunTemplate:
+    serviceAccountName: test-sa
+  pipelineRef:
+    name: p-task-consuming-results
+status:
+  pipelineSpec:
+    tasks:
+    - name: matrix-emitting-results
+      matrix:
+        params:
+          - name: platform
+            value:
+              - linux
+              - mac
+          - name: browser
+            value:
+              - chrome
+              - safari
+      taskRef:
+        name: taskwithresults
+        kind: Task
+    - name: task-consuming-results
+      params:
+        - name: result
+          value: $(tasks.matrix-emitting-results.results.report-url[*])
+      taskRef:
+        apiVersion: example.dev/v0
+        kind: Example
+  conditions:
+  - type: Succeeded
+    status: "Unknown"
+    reason: "Running"
+    message: "Tasks Completed: 1 (Failed: 0, Cancelled 0), Incomplete: 1, Skipped: 0"
+  childReferences:
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-emitting-results-0
+    pipelineTaskName: matrix-emitting-results
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-emitting-results-1
+    pipelineTaskName: matrix-emitting-results
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-emitting-results-2
+    pipelineTaskName: matrix-emitting-results
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: pr-matrix-emitting-results-3
+    pipelineTaskName: matrix-emitting-results
+  - apiVersion: tekton.dev/v1beta1
+    kind: CustomRun
+    name: pr-task-consuming-results
+    pipelineTaskName: task-consuming-results
+`),
+	}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pr := parse.MustParseV1PipelineRun(t, fmt.Sprintf(`
+metadata:
+  name: pr
+  namespace: foo
+spec:
+  taskRunTemplate:
+    serviceAccountName: test-sa
+  pipelineRef:
+    name: %s
+`, tt.name))
+			d := test.Data{
+				PipelineRuns: []*v1.PipelineRun{pr},
+				Pipelines:    []*v1.Pipeline{tt.p},
+				Tasks:        []*v1.Task{task1, taskwithresults},
+				TaskRuns:     tt.trs,
+				ConfigMaps:   cms,
+			}
+			prt := newPipelineRunTest(t, d)
+			defer prt.Cancel()
+			pipelineRun, clients := prt.reconcileRun("foo", "pr", []string{}, false)
+			customRuns, err := clients.Pipeline.TektonV1beta1().CustomRuns("foo").List(prt.TestAssets.Ctx, metav1.ListOptions{})
+			if err != nil {
+				t.Fatalf("Failure to list customRuns's %s", err)
+			}
+
+			if len(customRuns.Items) != 1 {
+				t.Fatalf("Expected 1 customRuns got %d", len(customRuns.Items))
+			}
+
+			for i := range customRuns.Items {
+				expectedCustomRun := expectedCustomRuns[i]
+				if d := cmp.Diff(expectedCustomRun, &customRuns.Items[i], ignoreResourceVersion, ignoreTypeMeta, ignoreProvenance, cmpopts.EquateEmpty()); d != "" {
+					t.Errorf("expected to see CustomRun %v created. Diff %s", expectedCustomRun.Name, diff.PrintWantGot(d))
+				}
+			}
+
+			if d := cmp.Diff(tt.expectedPipelineRun, pipelineRun, ignoreResourceVersion, ignoreTypeMeta, ignoreLastTransitionTime,
+				ignoreStartTime, ignoreFinallyStartTime, ignoreProvenance, cmpopts.EquateEmpty()); d != "" {
+				t.Errorf("expected PipelineRun was not created. Diff %s", diff.PrintWantGot(d))
+			}
+		})
+	}
+}
 func TestReconcile_SetDefaults(t *testing.T) {
 	names.TestingSeed()
 
@@ -13753,6 +15525,760 @@ spec:
 	// The PipelineRun should not be timed out.
 	if reconciledRun.Status.GetCondition(apis.ConditionSucceeded).Reason != "Succeeded" {
 		t.Errorf("Expected PipelineRun to still be Succeeded, but reason is %s", reconciledRun.Status.GetCondition(apis.ConditionSucceeded))
+	}
+}
+
+func TestReconcileWithResultsAndOutOfOrderTasks7103(t *testing.T) {
+	// TestReconcileWithResultsAndOutOfOrderTasks7103 runs "Reconcile" on a PipelineRun with three
+	// Tasks, defined in the following order:
+	// Task1 (t1): produces a result
+	// Task3 (t3): consumes results from t1 and t2
+	// Task2 (t3): produces a result
+	//
+	// The execution flows is (t1, t2) and then t3. The status at the beginning of the test is
+	// That t1 and t2 have been executed successfully, t3 has not been started.
+	ps := []*v1.Pipeline{parse.MustParseV1Pipeline(t, `
+metadata:
+  name: 7103-reproducer
+  namespace: foo
+spec:
+  tasks:
+  - name: task1
+    taskSpec:
+      results:
+      - name: foo
+        type: string
+      steps:
+        - name: step1
+          env:
+            - name: RESULT_PATH
+              value: $(results.foo.path)
+          image: ubuntu
+          script: |
+            #!/usr/bin/env bash
+            echo "foo-value" > "$RESULT_PATH"
+  - name: task3
+    runAfter:
+      - task1
+      - task2
+    params:
+      - name: foo-value
+        value: $(tasks.task1.results.foo)
+      - name: bar-value
+        value: $(tasks.task2.results.bar)
+    taskSpec:
+      steps:
+        - name: step1
+          env:
+            - name: FOO_VALUE
+              value: $(params.foo-value)
+            - name: BAR_VALUE
+              value: $(params.bar-value)
+          image: ubuntu
+          script: |
+            #!/usr/bin/env bash
+            echo "$FOO_VALUE"
+            echo "$BAR_VALUE"
+  - name: task2
+    taskSpec:
+      results:
+        - name: bar
+          type: string
+      steps:
+        - name: step1
+          env:
+            - name: RESULT_PATH
+              value: $(results.bar.path)
+          image: ubuntu
+          script: |
+            #!/usr/bin/env bash
+            echo "bar-value" > "$RESULT_PATH"
+`)}
+	prs := []*v1.PipelineRun{parse.MustParseV1PipelineRun(t, `
+metadata:
+  name: 7103-reproducer-run-7jp4w
+  namespace: foo
+spec:
+  pipelineRef:
+    name: 7103-reproducer
+status:
+  conditions:
+  - lastTransitionTime: "2023-10-03T10:55:19Z"
+    message: 'Tasks Completed: 2 (Failed: 0, Cancelled 0), Incomplete: 1, Skipped: 0'
+    reason: Running
+    status: Unknown
+    type: Succeeded
+  startTime: "2023-10-03T10:55:12Z"
+  childReferences:
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: 7103-reproducer-run-7jp4w-task1
+    pipelineTaskName: task1
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: 7103-reproducer-run-7jp4w-task2
+    pipelineTaskName: task2
+`)}
+	ts := []*v1.Task{simpleHelloWorldTask}
+
+	trs := []*v1.TaskRun{
+		mustParseTaskRunWithObjectMeta(t,
+			taskRunObjectMeta(
+				"7103-reproducer-run-7jp4w-task1",
+				"foo", "7103-reproducer-run-7jp4w",
+				"7103-reproducer", "task1", false), `
+status:
+  completionTime: "2023-10-03T10:55:19Z"
+  conditions:
+  - lastTransitionTime: "2023-10-03T10:55:19Z"
+    message: All Steps have completed executing
+    reason: Succeeded
+    status: "True"
+    type: Succeeded
+  podName: 7103-reproducer-run-7jp4w-task1-pod
+  results:
+  - name: foo
+    type: string
+    value: foo-value
+  startTime: "2023-10-03T10:55:12Z"
+`),
+		mustParseTaskRunWithObjectMeta(t,
+			taskRunObjectMeta(
+				"7103-reproducer-run-7jp4w-task2",
+				"foo", "7103-reproducer-run-7jp4w",
+				"7103-reproducer", "task2", false), `
+status:
+    completionTime: "2023-10-03T10:55:18Z"
+    conditions:
+    - lastTransitionTime: "2023-10-03T10:55:18Z"
+      message: All Steps have completed executing
+      reason: Succeeded
+      status: "True"
+      type: Succeeded
+    podName: 7103-reproducer-run-7jp4w-task2-pod
+    results:
+    - name: bar
+      type: string
+      value: bar-value
+    startTime: "2023-10-03T10:55:12Z"
+`)}
+
+	d := test.Data{
+		PipelineRuns: prs,
+		Pipelines:    ps,
+		Tasks:        ts,
+		TaskRuns:     trs,
+	}
+	prt := newPipelineRunTest(t, d)
+	defer prt.Cancel()
+
+	wantEvents := []string{}
+	reconciledRun, _ := prt.reconcileRun("foo", "7103-reproducer-run-7jp4w", wantEvents, false)
+
+	expectedPipelineRun := parse.MustParseV1PipelineRun(t, `
+metadata:
+  name: 7103-reproducer-run-7jp4w
+  namespace: foo
+  labels:
+    tekton.dev/pipeline: "7103-reproducer"
+  annotations: {}
+spec:
+  pipelineRef:
+    name: 7103-reproducer
+status:
+  conditions:
+  - lastTransitionTime: "2023-10-03T10:55:19Z"
+    message: 'Tasks Completed: 2 (Failed: 0, Cancelled 0), Incomplete: 1, Skipped: 0'
+    reason: Running
+    status: Unknown
+    type: Succeeded
+  startTime: "2023-10-03T10:55:12Z"
+  childReferences:
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: 7103-reproducer-run-7jp4w-task1
+    pipelineTaskName: task1
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: 7103-reproducer-run-7jp4w-task2
+    pipelineTaskName: task2
+  - apiVersion: tekton.dev/v1
+    kind: TaskRun
+    name: 7103-reproducer-run-7jp4w-task3
+    pipelineTaskName: task3
+`)
+	expectedPipelineRun.Status.PipelineSpec = &ps[0].Spec
+
+	// The PipelineRun should include a task3 child
+	if d := cmp.Diff(expectedPipelineRun, reconciledRun, ignoreResourceVersion, ignoreLastTransitionTime, ignoreTypeMeta, ignoreProvenance, ignoreStartTime); d != "" {
+		t.Errorf("Expected to see PipelineRun run with a task3 child reference %s", diff.PrintWantGot(d))
+	}
+
+	// The TaskRun for task3 is not reconciled (no status), but it must created with
+	// resolved parameters
+	expectedTaskRun := mustParseTaskRunWithObjectMeta(t,
+		taskRunObjectMeta(
+			"7103-reproducer-run-7jp4w-task3",
+			"foo", "7103-reproducer-run-7jp4w",
+			"7103-reproducer", "task3", false), `
+spec:
+  serviceAccountName: "default"
+  params:
+  - name: foo-value
+    value: foo-value
+  - name: bar-value
+    value: bar-value
+`)
+	// The taskSpec is already set by the reconcile to avoid an extra resolution
+	expectedTaskRun.Spec.TaskSpec = &ps[0].Spec.Tasks[1].TaskSpec.TaskSpec
+	taskRuns := getTaskRunsForPipelineRun(prt.TestAssets.Ctx, t, prt.TestAssets.Clients, "foo", "7103-reproducer-run-7jp4w")
+	// Ensure that there are 2 TaskRuns associated with this PipelineRun
+	validateTaskRunsCount(t, taskRuns, 3)
+
+	// Check that the expected TaskRun was created
+	actual := getTaskRunByName(t, taskRuns, "7103-reproducer-run-7jp4w-task3")
+	// The TaskRun for task3 should include resolved results
+	if d := cmp.Diff(expectedTaskRun, actual, ignoreResourceVersion, ignoreLastTransitionTime, ignoreTypeMeta, ignoreProvenance, ignoreStartTime); d != "" {
+		t.Errorf("Expected to see PipelineRun run with a task3 child reference %s", diff.PrintWantGot(d))
+	}
+}
+
+func Test_runNextSchedulableTask(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		pr               *v1.PipelineRun
+		pipelineRunFacts *resources.PipelineRunFacts
+		want             *resources.PipelineRunFacts
+		wantErr          bool
+	}{
+		{
+			name: "propagate strings, array, object results to next task",
+			pr: &v1.PipelineRun{
+				Status: v1.PipelineRunStatus{
+					Status: duckv1.Status{
+						Conditions: duckv1.Conditions{
+							{
+								Type:   apis.ConditionSucceeded,
+								Status: corev1.ConditionUnknown,
+							},
+						},
+					},
+				},
+				Spec: v1.PipelineRunSpec{
+					Status: v1.PipelineRunSpecStatusPending,
+					PipelineSpec: &v1.PipelineSpec{
+						Tasks: []v1.PipelineTask{
+							{
+								Name: "task1",
+							},
+							{
+								Name: "task2",
+							},
+						},
+					},
+				},
+			},
+			pipelineRunFacts: &resources.PipelineRunFacts{
+				State: resources.PipelineRunState{
+					{
+						TaskRunNames: []string{"task1"},
+						ResolvedTask: &taskresources.ResolvedTask{
+							TaskName: "task1",
+							TaskSpec: &v1.TaskSpec{
+								Steps: []v1.Step{
+									{
+										Name: "step1",
+									},
+								},
+							},
+						},
+						PipelineTask: &v1.PipelineTask{
+							Name: "task1",
+						},
+						TaskRuns: []*v1.TaskRun{
+							{
+								ObjectMeta: metav1.ObjectMeta{
+									Name: "task1",
+								},
+								Status: v1.TaskRunStatus{
+									Status: duckv1.Status{
+										Conditions: duckv1.Conditions{
+											{
+												Type:   apis.ConditionSucceeded,
+												Status: corev1.ConditionTrue,
+											},
+										},
+									},
+									TaskRunStatusFields: v1.TaskRunStatusFields{
+										// string, array, object results generated by task1
+										Results: []v1.TaskRunResult{
+											{
+												Name: "foo",
+												Type: v1.ResultsTypeString,
+												Value: v1.ResultValue{
+													StringVal: "bar",
+												},
+											},
+											{
+												Name: "commands",
+												Type: v1.ResultsTypeArray,
+												Value: v1.ResultValue{
+													ArrayVal: []string{"bash", "-c"},
+												},
+											},
+											{
+												Name: "objects",
+												Type: v1.ResultsTypeObject,
+												Value: v1.ResultValue{
+													ObjectVal: map[string]string{
+														"image": "alpine:latest",
+													},
+												},
+											},
+										},
+									},
+								},
+								Spec: v1.TaskRunSpec{TaskSpec: &v1.TaskSpec{}},
+							},
+						},
+					},
+					{
+						TaskRunNames: []string{"task2"},
+						ResolvedTask: &taskresources.ResolvedTask{
+							TaskName: "task2",
+							TaskSpec: &v1.TaskSpec{
+								Steps: []v1.Step{
+									{
+										// The results from task1 should be propagated to task2
+										Name:    "$(tasks.task1.results.foo)",
+										Command: []string{"$(tasks.task1.results.commands[*])"},
+										Image:   "$(tasks.task1.results.objects.image)",
+									},
+								},
+							},
+						},
+						PipelineTask: &v1.PipelineTask{
+							Name: "task2",
+						},
+					},
+				},
+				TasksGraph: &dag.Graph{
+					Nodes: map[string]*dag.Node{
+						"task1": {
+							Key: "task1",
+							Next: []*dag.Node{
+								{
+									Key: "task2",
+								},
+							},
+						},
+						"task2": {
+							Key: "task2",
+							Prev: []*dag.Node{
+								{
+									Key: "task1",
+								},
+							},
+						},
+					},
+				},
+				FinalTasksGraph: &dag.Graph{
+					Nodes: map[string]*dag.Node{},
+				},
+			},
+			want: &resources.PipelineRunFacts{
+				State: resources.PipelineRunState{
+					{
+						TaskRunNames: []string{"task1"},
+						ResolvedTask: &taskresources.ResolvedTask{
+							TaskName: "task1",
+							TaskSpec: &v1.TaskSpec{
+								Steps: []v1.Step{{Name: "step1"}},
+							},
+						},
+						PipelineTask: &v1.PipelineTask{
+							Name: "task1",
+						},
+						TaskRuns: []*v1.TaskRun{
+							{
+								ObjectMeta: metav1.ObjectMeta{
+									Name: "task1",
+								},
+								Status: v1.TaskRunStatus{
+									Status: duckv1.Status{
+										Conditions: duckv1.Conditions{
+											{
+												Type:   apis.ConditionSucceeded,
+												Status: corev1.ConditionTrue,
+											},
+										},
+									},
+									TaskRunStatusFields: v1.TaskRunStatusFields{
+										Results: []v1.TaskRunResult{
+											{
+												Name: "foo",
+												Type: v1.ResultsTypeString,
+												Value: v1.ResultValue{
+													StringVal: "bar",
+												},
+											},
+											{
+												Name: "commands",
+												Type: v1.ResultsTypeArray,
+												Value: v1.ResultValue{
+													ArrayVal: []string{"bash", "-c"},
+												},
+											},
+											{
+												Name: "objects",
+												Type: v1.ResultsTypeObject,
+												Value: v1.ResultValue{
+													ObjectVal: map[string]string{
+														"image": "alpine:latest",
+													},
+												},
+											},
+										},
+									},
+								},
+								Spec: v1.TaskRunSpec{TaskSpec: &v1.TaskSpec{}},
+							},
+						},
+					},
+					{
+						TaskRunNames: []string{"task2"},
+						ResolvedTask: &taskresources.ResolvedTask{
+							TaskName: "task2",
+							TaskSpec: &v1.TaskSpec{
+								Steps: []v1.Step{
+									{
+										// here we expect the results from task1 to be propagated to task2
+										Name:    "bar",
+										Command: []string{"bash", "-c"},
+										Image:   "alpine:latest",
+									},
+								},
+							},
+						},
+						PipelineTask: &v1.PipelineTask{
+							Name: "task2",
+						},
+						TaskRuns: []*v1.TaskRun{
+							{
+								ObjectMeta: metav1.ObjectMeta{
+									Name:            "task2",
+									ResourceVersion: "00002",
+									Labels:          map[string]string{"tekton.dev/pipelineRun": "", "tekton.dev/pipelineTask": "task2"},
+									OwnerReferences: []metav1.OwnerReference{
+										{
+											APIVersion:         "tekton.dev/v1",
+											Kind:               "PipelineRun",
+											Controller:         &[]bool{true}[0],
+											BlockOwnerDeletion: &[]bool{true}[0],
+										},
+									},
+									Annotations: map[string]string{},
+								},
+								Status: v1.TaskRunStatus{
+									Status: duckv1.Status{},
+								},
+								Spec: v1.TaskRunSpec{},
+							},
+						},
+					},
+				},
+				TasksGraph: &dag.Graph{
+					Nodes: map[string]*dag.Node{
+						"task1": {
+							Key: "task1",
+							Next: []*dag.Node{
+								{
+									Key: "task2",
+								},
+							},
+						},
+						"task2": {
+							Key: "task2",
+							Prev: []*dag.Node{
+								{
+									Key: "task1",
+								},
+							},
+						},
+					},
+				},
+				FinalTasksGraph: &dag.Graph{
+					Nodes: map[string]*dag.Node{},
+				},
+				SkipCache: map[string]resources.TaskSkipStatus{
+					"task1": {SkippingReason: "None"},
+					"task2": {SkippingReason: "None"},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "don't propagate results to next task if task is done",
+			pr: &v1.PipelineRun{
+				Status: v1.PipelineRunStatus{
+					Status: duckv1.Status{
+						Conditions: duckv1.Conditions{
+							{
+								Type:   apis.ConditionSucceeded,
+								Status: corev1.ConditionUnknown,
+							},
+						},
+					},
+				},
+				Spec: v1.PipelineRunSpec{
+					Status: v1.PipelineRunSpecStatusPending,
+					PipelineSpec: &v1.PipelineSpec{
+						Tasks: []v1.PipelineTask{
+							{
+								Name: "task1",
+							},
+							{
+								Name: "task2",
+							},
+						},
+					},
+				},
+			},
+			pipelineRunFacts: &resources.PipelineRunFacts{
+				State: resources.PipelineRunState{
+					{
+						TaskRunNames: []string{"task1"},
+						ResolvedTask: &taskresources.ResolvedTask{
+							TaskName: "task1",
+							TaskSpec: &v1.TaskSpec{
+								Steps: []v1.Step{
+									{
+										Name: "step1",
+									},
+								},
+							},
+						},
+						PipelineTask: &v1.PipelineTask{
+							Name: "task1",
+						},
+						TaskRuns: []*v1.TaskRun{
+							{
+								ObjectMeta: metav1.ObjectMeta{
+									Name: "task1",
+								},
+								Status: v1.TaskRunStatus{
+									Status: duckv1.Status{
+										Conditions: duckv1.Conditions{
+											{
+												Type:   apis.ConditionSucceeded,
+												Status: corev1.ConditionTrue,
+											},
+										},
+									},
+									TaskRunStatusFields: v1.TaskRunStatusFields{
+										Results: []v1.TaskRunResult{
+											{
+												Name: "foo",
+												Type: v1.ResultsTypeString,
+												Value: v1.ResultValue{
+													StringVal: "bar",
+												},
+											},
+										},
+									},
+								},
+								Spec: v1.TaskRunSpec{TaskSpec: &v1.TaskSpec{}},
+							},
+						},
+					},
+					{
+						TaskRunNames: []string{"task2"},
+						ResolvedTask: &taskresources.ResolvedTask{
+							TaskName: "task2",
+							TaskSpec: &v1.TaskSpec{
+								Steps: []v1.Step{
+									{
+										Name: "$(tasks.task1.results.foo)",
+									},
+								},
+							},
+						},
+						PipelineTask: &v1.PipelineTask{
+							Name: "task2",
+						},
+						TaskRuns: []*v1.TaskRun{
+							{
+								ObjectMeta: metav1.ObjectMeta{
+									Name: "task2",
+								},
+								Status: v1.TaskRunStatus{
+									Status: duckv1.Status{
+										Conditions: duckv1.Conditions{
+											{
+												Type:   apis.ConditionSucceeded,
+												Status: corev1.ConditionFalse,
+											},
+										},
+									},
+								},
+								Spec: v1.TaskRunSpec{TaskSpec: &v1.TaskSpec{}},
+							},
+						},
+					},
+				},
+				TasksGraph: &dag.Graph{
+					Nodes: map[string]*dag.Node{
+						"task1": {
+							Key: "task1",
+							Next: []*dag.Node{
+								{
+									Key: "task2",
+								},
+							},
+						},
+						"task2": {
+							Key: "task2",
+							Prev: []*dag.Node{
+								{
+									Key: "task1",
+								},
+							},
+						},
+					},
+				},
+				FinalTasksGraph: &dag.Graph{
+					Nodes: map[string]*dag.Node{},
+				},
+			},
+			want: &resources.PipelineRunFacts{
+				State: resources.PipelineRunState{
+					{
+						TaskRunNames: []string{"task1"},
+						ResolvedTask: &taskresources.ResolvedTask{
+							TaskName: "task1",
+							TaskSpec: &v1.TaskSpec{
+								Steps: []v1.Step{{Name: "step1"}},
+							},
+						},
+						PipelineTask: &v1.PipelineTask{
+							Name: "task1",
+						},
+						TaskRuns: []*v1.TaskRun{
+							{
+								ObjectMeta: metav1.ObjectMeta{
+									Name: "task1",
+								},
+								Status: v1.TaskRunStatus{
+									Status: duckv1.Status{
+										Conditions: duckv1.Conditions{
+											{
+												Type:   apis.ConditionSucceeded,
+												Status: corev1.ConditionTrue,
+											},
+										},
+									},
+									TaskRunStatusFields: v1.TaskRunStatusFields{
+										Results: []v1.TaskRunResult{
+											{
+												Name: "foo",
+												Type: v1.ResultsTypeString,
+												Value: v1.ResultValue{
+													StringVal: "bar",
+												},
+											},
+										},
+									},
+								},
+								Spec: v1.TaskRunSpec{TaskSpec: &v1.TaskSpec{}},
+							},
+						},
+					},
+					{
+						TaskRunNames: []string{"task2"},
+						ResolvedTask: &taskresources.ResolvedTask{
+							TaskName: "task2",
+							TaskSpec: &v1.TaskSpec{
+								Steps: []v1.Step{
+									{
+										Name: "$(tasks.task1.results.foo)",
+									},
+								},
+							},
+						},
+						PipelineTask: &v1.PipelineTask{
+							Name: "task2",
+						},
+						TaskRuns: []*v1.TaskRun{
+							{
+								ObjectMeta: metav1.ObjectMeta{
+									Name: "task2",
+								},
+								Status: v1.TaskRunStatus{
+									Status: duckv1.Status{
+										Conditions: duckv1.Conditions{
+											{
+												Type:   apis.ConditionSucceeded,
+												Status: corev1.ConditionFalse,
+											},
+										},
+									},
+								},
+								Spec: v1.TaskRunSpec{TaskSpec: &v1.TaskSpec{}},
+							},
+						},
+					},
+				},
+				TasksGraph: &dag.Graph{
+					Nodes: map[string]*dag.Node{
+						"task1": {
+							Key: "task1",
+							Next: []*dag.Node{
+								{
+									Key: "task2",
+								},
+							},
+						},
+						"task2": {
+							Key: "task2",
+							Prev: []*dag.Node{
+								{
+									Key: "task1",
+								},
+							},
+						},
+					},
+				},
+				FinalTasksGraph: &dag.Graph{
+					Nodes: map[string]*dag.Node{},
+				},
+				SkipCache: map[string]resources.TaskSkipStatus{
+					"task1": {SkippingReason: "None"},
+					"task2": {SkippingReason: "None"},
+				},
+			},
+			wantErr: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, _ := ttesting.SetupFakeContext(t)
+			testAssets, cancel := getPipelineRunController(t, test.Data{
+				PipelineRuns: []*v1.PipelineRun{tc.pr},
+			})
+			defer cancel()
+			c := &Reconciler{
+				Clock:             clock.NewFakePassiveClock(time.Now()),
+				KubeClientSet:     testAssets.Clients.Kube,
+				PipelineClientSet: testAssets.Clients.Pipeline,
+				tracerProvider:    tracing.New("pipelinerun"),
+			}
+			err := c.runNextSchedulableTask(ctx, tc.pr, tc.pipelineRunFacts)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("runNextSchedulableTask() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if diff := cmp.Diff(tc.want, tc.pipelineRunFacts); diff != "" {
+				t.Errorf("runNextSchedulableTask() got unexpected pipelineRunFacts diff %s", diff)
+			}
+		})
 	}
 }
 

@@ -69,9 +69,13 @@ func TestNewFeatureFlagsFromConfigMap(t *testing.T) {
 				VerificationNoMatchPolicy:        config.FailNoMatchPolicy,
 				EnableProvenanceInStatus:         false,
 				ResultExtractionMethod:           "termination-message",
+				EnableKeepPodOnCancel:            true,
 				MaxResultSize:                    4096,
 				SetSecurityContext:               true,
 				Coschedule:                       config.CoscheduleDisabled,
+				EnableCELInWhenExpression:        true,
+				EnableStepActions:                true,
+				EnableParamEnum:                  true,
 			},
 			fileName: "feature-flags-all-flags-set",
 		},
@@ -259,6 +263,24 @@ func TestNewFeatureFlagsConfigMapErrors(t *testing.T) {
 	}, {
 		fileName: "feature-flags-invalid-coschedule",
 		want:     `invalid value for feature flag "coschedule": "invalid"`,
+	}, {
+		fileName: "feature-flags-invalid-keep-pod-on-cancel",
+		want:     `failed parsing feature flags config "invalid": strconv.ParseBool: parsing "invalid": invalid syntax`,
+	}, {
+		fileName: "feature-flags-invalid-running-in-environment-with-injected-sidecars",
+		want:     `failed parsing feature flags config "invalid-boolean": strconv.ParseBool: parsing "invalid-boolean": invalid syntax`,
+	}, {
+		fileName: "feature-flags-invalid-disable-affinity-assistant",
+		want:     `failed parsing feature flags config "truee": strconv.ParseBool: parsing "truee": invalid syntax`,
+	}, {
+		fileName: "feature-flags-invalid-enable-cel-in-whenexpression",
+		want:     `failed parsing feature flags config "invalid": strconv.ParseBool: parsing "invalid": invalid syntax`,
+	}, {
+		fileName: "feature-flags-invalid-enable-step-actions",
+		want:     `failed parsing feature flags config "invalid": strconv.ParseBool: parsing "invalid": invalid syntax`,
+	}, {
+		fileName: "feature-flags-invalid-enable-param-enum",
+		want:     `failed parsing feature flags config "invalid": strconv.ParseBool: parsing "invalid": invalid syntax`,
 	}} {
 		t.Run(tc.fileName, func(t *testing.T) {
 			cm := test.ConfigMapFromTestFile(t, tc.fileName)

@@ -1932,7 +1932,10 @@ ParamValue
 <th>Description</th>
 </tr>
 </thead>
-<tbody><tr><td><p>&#34;Cancelled&#34;</p></td>
+<tbody><tr><td><p>&#34;CELEvaluationFailed&#34;</p></td>
+<td><p>ReasonCELEvaluationFailed indicates the pipeline fails the CEL evaluation</p>
+</td>
+</tr><tr><td><p>&#34;Cancelled&#34;</p></td>
 <td><p>PipelineRunReasonCancelled is the reason set when the PipelineRun cancelled by the user
 This reason may be found with a corev1.ConditionFalse status, if the cancellation was processed successfully
 This reason may be found with a corev1.ConditionUnknown status, if the cancellation is being processed or failed</p>
@@ -2851,6 +2854,23 @@ PipelineSpec
 Note: PipelineSpec is in preview mode and not yet supported</p>
 </td>
 </tr>
+<tr>
+<td>
+<code>onError</code><br/>
+<em>
+<a href="#tekton.dev/v1.PipelineTaskOnErrorType">
+PipelineTaskOnErrorType
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>OnError defines the exiting behavior of a PipelineRun on error
+can be set to [ continue | stopAndFail ]
+Note: OnError is in preview mode and not yet supported
+TODO(#7165)</p>
+</td>
+</tr>
 </tbody>
 </table>
 <h3 id="tekton.dev/v1.PipelineTaskMetadata">PipelineTaskMetadata
@@ -2892,6 +2912,29 @@ map[string]string
 </td>
 </tr>
 </tbody>
+</table>
+<h3 id="tekton.dev/v1.PipelineTaskOnErrorType">PipelineTaskOnErrorType
+(<code>string</code> alias)</h3>
+<p>
+(<em>Appears on:</em><a href="#tekton.dev/v1.PipelineTask">PipelineTask</a>)
+</p>
+<div>
+<p>PipelineTaskOnErrorType defines a list of supported failure handling behaviors of a PipelineTask on error</p>
+</div>
+<table>
+<thead>
+<tr>
+<th>Value</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr><td><p>&#34;continue&#34;</p></td>
+<td><p>PipelineTaskContinue indicates to continue executing the rest of the DAG when the PipelineTask fails</p>
+</td>
+</tr><tr><td><p>&#34;stopAndFail&#34;</p></td>
+<td><p>PipelineTaskStopAndFail indicates to stop and fail the PipelineRun if the PipelineTask fails</p>
+</td>
+</tr></tbody>
 </table>
 <h3 id="tekton.dev/v1.PipelineTaskParam">PipelineTaskParam
 </h3>
@@ -3226,6 +3269,35 @@ github.com/tektoncd/pipeline/pkg/apis/config.FeatureFlags
 </td>
 <td>
 <p>FeatureFlags identifies the feature flags that were used during the task/pipeline run</p>
+</td>
+</tr>
+</tbody>
+</table>
+<h3 id="tekton.dev/v1.Ref">Ref
+</h3>
+<p>
+(<em>Appears on:</em><a href="#tekton.dev/v1.Step">Step</a>)
+</p>
+<div>
+<p>Ref can be used to refer to a specific instance of a StepAction.</p>
+</div>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>
+<code>name</code><br/>
+<em>
+string
+</em>
+</td>
+<td>
+<p>Name of the referenced step</p>
 </td>
 </tr>
 </tbody>
@@ -4313,6 +4385,20 @@ StepOutputConfig
 <p>Stores configuration for the stderr stream of the step.</p>
 </td>
 </tr>
+<tr>
+<td>
+<code>ref</code><br/>
+<em>
+<a href="#tekton.dev/v1.Ref">
+Ref
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>Contains the reference to an existing StepAction.</p>
+</td>
+</tr>
 </tbody>
 </table>
 <h3 id="tekton.dev/v1.StepOutputConfig">StepOutputConfig
@@ -4607,6 +4693,37 @@ More info: <a href="https://kubernetes.io/docs/tasks/configure-pod-container/sec
 </tr>
 </tbody>
 </table>
+<h3 id="tekton.dev/v1.TaskBreakpoints">TaskBreakpoints
+</h3>
+<p>
+(<em>Appears on:</em><a href="#tekton.dev/v1.TaskRunDebug">TaskRunDebug</a>)
+</p>
+<div>
+<p>TaskBreakpoints defines the breakpoint config for a particular Task</p>
+</div>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>
+<code>onFailure</code><br/>
+<em>
+string
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>if enabled, pause TaskRun on failure of a step
+failed step will not exit</p>
+</td>
+</tr>
+</tbody>
+</table>
 <h3 id="tekton.dev/v1.TaskKind">TaskKind
 (<code>string</code> alias)</h3>
 <p>
@@ -4792,9 +4909,11 @@ string
 <tbody>
 <tr>
 <td>
-<code>breakpoint</code><br/>
+<code>breakpoints</code><br/>
 <em>
-[]string
+<a href="#tekton.dev/v1.TaskBreakpoints">
+TaskBreakpoints
+</a>
 </em>
 </td>
 <td>
@@ -5709,6 +5828,20 @@ k8s.io/apimachinery/pkg/selection.Operator
 It must be non-empty</p>
 </td>
 </tr>
+<tr>
+<td>
+<code>cel</code><br/>
+<em>
+string
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>CEL is a string of Common Language Expression, which can be used to conditionally execute
+the task based on the result of the expression evaluation
+More info about CEL syntax: <a href="https://github.com/google/cel-spec/blob/master/doc/langdef.md">https://github.com/google/cel-spec/blob/master/doc/langdef.md</a></p>
+</td>
+</tr>
 </tbody>
 </table>
 <h3 id="tekton.dev/v1.WhenExpressions">WhenExpressions
@@ -6047,6 +6180,8 @@ Resource Types:
 <ul><li>
 <a href="#tekton.dev/v1alpha1.Run">Run</a>
 </li><li>
+<a href="#tekton.dev/v1alpha1.StepAction">StepAction</a>
+</li><li>
 <a href="#tekton.dev/v1alpha1.VerificationPolicy">VerificationPolicy</a>
 </li><li>
 <a href="#tekton.dev/v1alpha1.PipelineResource">PipelineResource</a>
@@ -6262,6 +6397,151 @@ RunStatus
 </td>
 <td>
 <em>(Optional)</em>
+</td>
+</tr>
+</tbody>
+</table>
+<h3 id="tekton.dev/v1alpha1.StepAction">StepAction
+</h3>
+<div>
+<p>StepAction represents the actionable components of Step.
+The Step can only reference it from the cluster or using remote resolution.</p>
+</div>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>
+<code>apiVersion</code><br/>
+string</td>
+<td>
+<code>
+tekton.dev/v1alpha1
+</code>
+</td>
+</tr>
+<tr>
+<td>
+<code>kind</code><br/>
+string
+</td>
+<td><code>StepAction</code></td>
+</tr>
+<tr>
+<td>
+<code>metadata</code><br/>
+<em>
+<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.24/#objectmeta-v1-meta">
+Kubernetes meta/v1.ObjectMeta
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+Refer to the Kubernetes API documentation for the fields of the
+<code>metadata</code> field.
+</td>
+</tr>
+<tr>
+<td>
+<code>spec</code><br/>
+<em>
+<a href="#tekton.dev/v1alpha1.StepActionSpec">
+StepActionSpec
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>Spec holds the desired state of the Step from the client</p>
+<br/>
+<br/>
+<table>
+<tr>
+<td>
+<code>image</code><br/>
+<em>
+string
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>Image reference name to run for this StepAction.
+More info: <a href="https://kubernetes.io/docs/concepts/containers/images">https://kubernetes.io/docs/concepts/containers/images</a></p>
+</td>
+</tr>
+<tr>
+<td>
+<code>command</code><br/>
+<em>
+[]string
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>Entrypoint array. Not executed within a shell.
+The image&rsquo;s ENTRYPOINT is used if this is not provided.
+Variable references $(VAR_NAME) are expanded using the container&rsquo;s environment. If a variable
+cannot be resolved, the reference in the input string will be unchanged. Double $$ are reduced
+to a single $, which allows for escaping the $(VAR_NAME) syntax: i.e. &ldquo;$$(VAR_NAME)&rdquo; will
+produce the string literal &ldquo;$(VAR_NAME)&rdquo;. Escaped references will never be expanded, regardless
+of whether the variable exists or not. Cannot be updated.
+More info: <a href="https://kubernetes.io/docs/tasks/inject-data-application/define-command-argument-container/#running-a-command-in-a-shell">https://kubernetes.io/docs/tasks/inject-data-application/define-command-argument-container/#running-a-command-in-a-shell</a></p>
+</td>
+</tr>
+<tr>
+<td>
+<code>args</code><br/>
+<em>
+[]string
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>Arguments to the entrypoint.
+The image&rsquo;s CMD is used if this is not provided.
+Variable references $(VAR_NAME) are expanded using the container&rsquo;s environment. If a variable
+cannot be resolved, the reference in the input string will be unchanged. Double $$ are reduced
+to a single $, which allows for escaping the $(VAR_NAME) syntax: i.e. &ldquo;$$(VAR_NAME)&rdquo; will
+produce the string literal &ldquo;$(VAR_NAME)&rdquo;. Escaped references will never be expanded, regardless
+of whether the variable exists or not. Cannot be updated.
+More info: <a href="https://kubernetes.io/docs/tasks/inject-data-application/define-command-argument-container/#running-a-command-in-a-shell">https://kubernetes.io/docs/tasks/inject-data-application/define-command-argument-container/#running-a-command-in-a-shell</a></p>
+</td>
+</tr>
+<tr>
+<td>
+<code>env</code><br/>
+<em>
+<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.24/#envvar-v1-core">
+[]Kubernetes core/v1.EnvVar
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>List of environment variables to set in the container.
+Cannot be updated.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>script</code><br/>
+<em>
+string
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>Script is the contents of an executable file to execute.</p>
+<p>If Script is not empty, the Step cannot have an Command and the Args will be passed to the Script.</p>
+</td>
+</tr>
+</table>
 </td>
 </tr>
 </tbody>
@@ -6921,6 +7201,108 @@ Refer Go&rsquo;s ParseDuration documentation for expected format: <a href="https
 <div>
 <p>RunSpecStatusMessage defines human readable status messages for the TaskRun.</p>
 </div>
+<h3 id="tekton.dev/v1alpha1.StepActionObject">StepActionObject
+</h3>
+<div>
+<p>StepActionObject is implemented by StepAction</p>
+</div>
+<h3 id="tekton.dev/v1alpha1.StepActionSpec">StepActionSpec
+</h3>
+<p>
+(<em>Appears on:</em><a href="#tekton.dev/v1alpha1.StepAction">StepAction</a>)
+</p>
+<div>
+<p>StepActionSpec contains the actionable components of a step.</p>
+</div>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>
+<code>image</code><br/>
+<em>
+string
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>Image reference name to run for this StepAction.
+More info: <a href="https://kubernetes.io/docs/concepts/containers/images">https://kubernetes.io/docs/concepts/containers/images</a></p>
+</td>
+</tr>
+<tr>
+<td>
+<code>command</code><br/>
+<em>
+[]string
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>Entrypoint array. Not executed within a shell.
+The image&rsquo;s ENTRYPOINT is used if this is not provided.
+Variable references $(VAR_NAME) are expanded using the container&rsquo;s environment. If a variable
+cannot be resolved, the reference in the input string will be unchanged. Double $$ are reduced
+to a single $, which allows for escaping the $(VAR_NAME) syntax: i.e. &ldquo;$$(VAR_NAME)&rdquo; will
+produce the string literal &ldquo;$(VAR_NAME)&rdquo;. Escaped references will never be expanded, regardless
+of whether the variable exists or not. Cannot be updated.
+More info: <a href="https://kubernetes.io/docs/tasks/inject-data-application/define-command-argument-container/#running-a-command-in-a-shell">https://kubernetes.io/docs/tasks/inject-data-application/define-command-argument-container/#running-a-command-in-a-shell</a></p>
+</td>
+</tr>
+<tr>
+<td>
+<code>args</code><br/>
+<em>
+[]string
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>Arguments to the entrypoint.
+The image&rsquo;s CMD is used if this is not provided.
+Variable references $(VAR_NAME) are expanded using the container&rsquo;s environment. If a variable
+cannot be resolved, the reference in the input string will be unchanged. Double $$ are reduced
+to a single $, which allows for escaping the $(VAR_NAME) syntax: i.e. &ldquo;$$(VAR_NAME)&rdquo; will
+produce the string literal &ldquo;$(VAR_NAME)&rdquo;. Escaped references will never be expanded, regardless
+of whether the variable exists or not. Cannot be updated.
+More info: <a href="https://kubernetes.io/docs/tasks/inject-data-application/define-command-argument-container/#running-a-command-in-a-shell">https://kubernetes.io/docs/tasks/inject-data-application/define-command-argument-container/#running-a-command-in-a-shell</a></p>
+</td>
+</tr>
+<tr>
+<td>
+<code>env</code><br/>
+<em>
+<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.24/#envvar-v1-core">
+[]Kubernetes core/v1.EnvVar
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>List of environment variables to set in the container.
+Cannot be updated.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>script</code><br/>
+<em>
+string
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>Script is the contents of an executable file to execute.</p>
+<p>If Script is not empty, the Step cannot have an Command and the Args will be passed to the Script.</p>
+</td>
+</tr>
+</tbody>
+</table>
 <h3 id="tekton.dev/v1alpha1.VerificationPolicySpec">VerificationPolicySpec
 </h3>
 <p>
@@ -10900,6 +11282,23 @@ PipelineSpec
 Note: PipelineSpec is in preview mode and not yet supported</p>
 </td>
 </tr>
+<tr>
+<td>
+<code>onError</code><br/>
+<em>
+<a href="#tekton.dev/v1beta1.PipelineTaskOnErrorType">
+PipelineTaskOnErrorType
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>OnError defines the exiting behavior of a PipelineRun on error
+can be set to [ continue | stopAndFail ]
+Note: OnError is in preview mode and not yet supported
+TODO(#7165)</p>
+</td>
+</tr>
 </tbody>
 </table>
 <h3 id="tekton.dev/v1beta1.PipelineTaskInputResource">PipelineTaskInputResource
@@ -10998,6 +11397,14 @@ map[string]string
 </tr>
 </tbody>
 </table>
+<h3 id="tekton.dev/v1beta1.PipelineTaskOnErrorType">PipelineTaskOnErrorType
+(<code>string</code> alias)</h3>
+<p>
+(<em>Appears on:</em><a href="#tekton.dev/v1beta1.PipelineTask">PipelineTask</a>)
+</p>
+<div>
+<p>PipelineTaskOnErrorType defines a list of supported failure handling behaviors of a PipelineTask on error</p>
+</div>
 <h3 id="tekton.dev/v1beta1.PipelineTaskOutputResource">PipelineTaskOutputResource
 </h3>
 <p>
@@ -11393,6 +11800,35 @@ github.com/tektoncd/pipeline/pkg/apis/config.FeatureFlags
 </td>
 <td>
 <p>FeatureFlags identifies the feature flags that were used during the task/pipeline run</p>
+</td>
+</tr>
+</tbody>
+</table>
+<h3 id="tekton.dev/v1beta1.Ref">Ref
+</h3>
+<p>
+(<em>Appears on:</em><a href="#tekton.dev/v1beta1.Step">Step</a>)
+</p>
+<div>
+<p>Ref can be used to refer to a specific instance of a StepAction.</p>
+</div>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>
+<code>name</code><br/>
+<em>
+string
+</em>
+</td>
+<td>
+<p>Name of the referenced step</p>
 </td>
 </tr>
 </tbody>
@@ -12593,6 +13029,20 @@ StepOutputConfig
 <p>Stores configuration for the stderr stream of the step.</p>
 </td>
 </tr>
+<tr>
+<td>
+<code>ref</code><br/>
+<em>
+<a href="#tekton.dev/v1beta1.Ref">
+Ref
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>Contains the reference to an existing StepAction.</p>
+</td>
+</tr>
 </tbody>
 </table>
 <h3 id="tekton.dev/v1beta1.StepOutputConfig">StepOutputConfig
@@ -13069,6 +13519,37 @@ Default is false.</p>
 </tr>
 </tbody>
 </table>
+<h3 id="tekton.dev/v1beta1.TaskBreakpoints">TaskBreakpoints
+</h3>
+<p>
+(<em>Appears on:</em><a href="#tekton.dev/v1beta1.TaskRunDebug">TaskRunDebug</a>)
+</p>
+<div>
+<p>TaskBreakpoints defines the breakpoint config for a particular Task</p>
+</div>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>
+<code>onFailure</code><br/>
+<em>
+string
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>if enabled, pause TaskRun on failure of a step
+failed step will not exit</p>
+</td>
+</tr>
+</tbody>
+</table>
 <h3 id="tekton.dev/v1beta1.TaskKind">TaskKind
 (<code>string</code> alias)</h3>
 <p>
@@ -13404,9 +13885,11 @@ conditions such as one used in spire results verification</p>
 <tbody>
 <tr>
 <td>
-<code>breakpoint</code><br/>
+<code>breakpoints</code><br/>
 <em>
-[]string
+<a href="#tekton.dev/v1beta1.TaskBreakpoints">
+TaskBreakpoints
+</a>
 </em>
 </td>
 <td>
@@ -14416,6 +14899,20 @@ k8s.io/apimachinery/pkg/selection.Operator
 <td>
 <p>Values is an array of strings, which is compared against the input, for guard checking
 It must be non-empty</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>cel</code><br/>
+<em>
+string
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>CEL is a string of Common Language Expression, which can be used to conditionally execute
+the task based on the result of the expression evaluation
+More info about CEL syntax: <a href="https://github.com/google/cel-spec/blob/master/doc/langdef.md">https://github.com/google/cel-spec/blob/master/doc/langdef.md</a></p>
 </td>
 </tr>
 </tbody>

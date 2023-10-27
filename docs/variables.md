@@ -28,10 +28,12 @@ For instructions on using variable substitutions see the relevant section of [th
 | `params["<param name>"][i]` | (see above) |
 | `params.<object-param-name>[*]` | Get the value of the whole object param. This is alpha feature, set `enable-api-fields` to `alpha`  to use it.|
 | `params.<object-param-name>.<individual-key-name>` | Get the value of an individual child of an object param. This is alpha feature, set `enable-api-fields` to `alpha`  to use it. |
+| `tasks.<taskName>.matrix.length` | The length of the `Matrix` combination count. |
 | `tasks.<taskName>.results.<resultName>` | The value of the `Task's` result. Can alter `Task` execution order within a `Pipeline`.) |
 | `tasks.<taskName>.results.<resultName>[i]` | The ith value of the `Task's` array result. Can alter `Task` execution order within a `Pipeline`.) |
 | `tasks.<taskName>.results.<resultName>[*]` | The array value of the `Task's` result. Can alter `Task` execution order within a `Pipeline`. Cannot be used in `script`.) |
 | `tasks.<taskName>.results.<resultName>.key` | The `key` value of the `Task's` object result. Can alter `Task` execution order within a `Pipeline`.) |
+| `tasks.<taskName>.matrix.<resultName>.length` | The length of the matrixed `Task's` results. (Can alter `Task` execution order within a `Pipeline`.) |
 | `workspaces.<workspaceName>.bound` | Whether a `Workspace` has been bound or not. "false" if the `Workspace` declaration has `optional: true` and the Workspace binding was omitted by the PipelineRun. |
 | `context.pipelineRun.name` | The name of the `PipelineRun` that this `Pipeline` is running in. |
 | `context.pipelineRun.namespace` | The namespace of the `PipelineRun` that this `Pipeline` is running in. |
@@ -73,54 +75,55 @@ For instructions on using variable substitutions see the relevant section of [th
 
 ## Fields that accept variable substitutions
 
-| CRD | Field |
-| --- | ----- |
-| `Task` | `spec.steps[].name` |
-| `Task` | `spec.steps[].image` |
-| `Task` | `spec.steps[].imagePullPolicy` |
-| `Task` | `spec.steps[].command` |
-| `Task` | `spec.steps[].args` |
-| `Task` | `spec.steps[].script` |
-| `Task` | `spec.steps[].onError` |
-| `Task` | `spec.steps[].env.value` |
-| `Task` | `spec.steps[].env.valuefrom.secretkeyref.name` |
-| `Task` | `spec.steps[].env.valuefrom.secretkeyref.key` |
-| `Task` | `spec.steps[].env.valuefrom.configmapkeyref.name` |
-| `Task` | `spec.steps[].env.valuefrom.configmapkeyref.key` |
-| `Task` | `spec.steps[].volumemounts.name` |
-| `Task` | `spec.steps[].volumemounts.mountpath` |
-| `Task` | `spec.steps[].volumemounts.subpath` |
-| `Task` | `spec.volumes[].name` |
-| `Task` | `spec.volumes[].configmap.name` |
-| `Task` | `spec.volumes[].configmap.items[].key` |
-| `Task` | `spec.volumes[].configmap.items[].path` |
-| `Task` | `spec.volumes[].secret.secretname` |
-| `Task` | `spec.volumes[].secret.items[].key` |
-| `Task` | `spec.volumes[].secret.items[].path` |
-| `Task` | `spec.volumes[].persistentvolumeclaim.claimname` |
-| `Task` | `spec.volumes[].projected.sources.configmap.name` |
-| `Task` | `spec.volumes[].projected.sources.secret.name` |
+| CRD | Field                                                           |
+| --- |-----------------------------------------------------------------|
+| `Task` | `spec.steps[].name`                                             |
+| `Task` | `spec.steps[].image`                                            |
+| `Task` | `spec.steps[].imagePullPolicy`                                  |
+| `Task` | `spec.steps[].command`                                          |
+| `Task` | `spec.steps[].args`                                             |
+| `Task` | `spec.steps[].script`                                           |
+| `Task` | `spec.steps[].onError`                                          |
+| `Task` | `spec.steps[].env.value`                                        |
+| `Task` | `spec.steps[].env.valuefrom.secretkeyref.name`                  |
+| `Task` | `spec.steps[].env.valuefrom.secretkeyref.key`                   |
+| `Task` | `spec.steps[].env.valuefrom.configmapkeyref.name`               |
+| `Task` | `spec.steps[].env.valuefrom.configmapkeyref.key`                |
+| `Task` | `spec.steps[].volumemounts.name`                                |
+| `Task` | `spec.steps[].volumemounts.mountpath`                           |
+| `Task` | `spec.steps[].volumemounts.subpath`                             |
+| `Task` | `spec.volumes[].name`                                           |
+| `Task` | `spec.volumes[].configmap.name`                                 |
+| `Task` | `spec.volumes[].configmap.items[].key`                          |
+| `Task` | `spec.volumes[].configmap.items[].path`                         |
+| `Task` | `spec.volumes[].secret.secretname`                              |
+| `Task` | `spec.volumes[].secret.items[].key`                             |
+| `Task` | `spec.volumes[].secret.items[].path`                            |
+| `Task` | `spec.volumes[].persistentvolumeclaim.claimname`                |
+| `Task` | `spec.volumes[].projected.sources.configmap.name`               |
+| `Task` | `spec.volumes[].projected.sources.secret.name`                  |
 | `Task` | `spec.volumes[].projected.sources.serviceaccounttoken.audience` |
-| `Task` | `spec.volumes[].csi.nodepublishsecretref.name` |
-| `Task` | `spec.volumes[].csi.volumeattributes.* `|
-| `Task` | `spec.sidecars[].name` |
-| `Task` | `spec.sidecars[].image` |
-| `Task` | `spec.sidecars[].imagePullPolicy` |
-| `Task` | `spec.sidecars[].env.value` |
-| `Task` | `spec.sidecars[].env.valuefrom.secretkeyref.name` |
-| `Task` | `spec.sidecars[].env.valuefrom.secretkeyref.key` |
-| `Task` | `spec.sidecars[].env.valuefrom.configmapkeyref.name` |
-| `Task` | `spec.sidecars[].env.valuefrom.configmapkeyref.key` |
-| `Task` | `spec.sidecars[].volumemounts.name` |
-| `Task` | `spec.sidecars[].volumemounts.mountpath` |
-| `Task` | `spec.sidecars[].volumemounts.subpath` |
-| `Task` | `spec.sidecars[].command` |
-| `Task` | `spec.sidecars[].args` |
-| `Task` | `spec.sidecars[].script` |
-| `Task` | `spec.workspaces[].mountPath` |
-| `Pipeline` | `spec.tasks[].params[].value` |
-| `Pipeline` | `spec.tasks[].conditions[].params[].value` |
-| `Pipeline` | `spec.results[].value` |
-| `Pipeline` | `spec.tasks[].when[].input` |
-| `Pipeline` | `spec.tasks[].when[].values` |
-| `Pipeline` | `spec.tasks[].workspaces[].subPath` |
+| `Task` | `spec.volumes[].csi.nodepublishsecretref.name`                  |
+| `Task` | `spec.volumes[].csi.volumeattributes.* `                        |
+| `Task` | `spec.sidecars[].name`                                          |
+| `Task` | `spec.sidecars[].image`                                         |
+| `Task` | `spec.sidecars[].imagePullPolicy`                               |
+| `Task` | `spec.sidecars[].env.value`                                     |
+| `Task` | `spec.sidecars[].env.valuefrom.secretkeyref.name`               |
+| `Task` | `spec.sidecars[].env.valuefrom.secretkeyref.key`                |
+| `Task` | `spec.sidecars[].env.valuefrom.configmapkeyref.name`            |
+| `Task` | `spec.sidecars[].env.valuefrom.configmapkeyref.key`             |
+| `Task` | `spec.sidecars[].volumemounts.name`                             |
+| `Task` | `spec.sidecars[].volumemounts.mountpath`                        |
+| `Task` | `spec.sidecars[].volumemounts.subpath`                          |
+| `Task` | `spec.sidecars[].command`                                       |
+| `Task` | `spec.sidecars[].args`                                          |
+| `Task` | `spec.sidecars[].script`                                        |
+| `Task` | `spec.workspaces[].mountPath`                                   |
+| `Pipeline` | `spec.tasks[].params[].value`                                   |
+| `Pipeline` | `spec.tasks[].conditions[].params[].value`                      |
+| `Pipeline` | `spec.results[].value`                                          |
+| `Pipeline` | `spec.tasks[].when[].input`                                     |
+| `Pipeline` | `spec.tasks[].when[].values`                                    |
+| `Pipeline` | `spec.tasks[].workspaces[].subPath`                             |
+| `Pipeline` | `spec.tasks[].displayName`                                      |

@@ -1040,7 +1040,7 @@ func TestPipelineRunSpec_Invalidate(t *testing.T) {
 		),
 		withContext: cfgtesting.EnableAlphaAPIFields,
 	}, {
-		name: "computeResources disallowed without alpha feature gate",
+		name: "computeResources disallowed without beta feature gate",
 		spec: v1.PipelineRunSpec{
 			PipelineRef: &v1.PipelineRef{Name: "foo"},
 			TaskRunSpecs: []v1.PipelineTaskRunSpec{
@@ -1053,7 +1053,7 @@ func TestPipelineRunSpec_Invalidate(t *testing.T) {
 			},
 		},
 		withContext: cfgtesting.EnableStableAPIFields,
-		wantErr:     apis.ErrGeneric("computeResources requires \"enable-api-fields\" feature gate to be \"alpha\" but it is \"stable\"").ViaIndex(0).ViaField("taskRunSpecs"),
+		wantErr:     apis.ErrGeneric("computeResources requires \"enable-api-fields\" feature gate to be \"alpha\" or \"beta\" but it is \"stable\"").ViaIndex(0).ViaField("taskRunSpecs"),
 	}}
 
 	for _, ps := range tests {
@@ -1317,7 +1317,7 @@ func TestPipelineRun_InvalidTimeouts(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			err := tc.pr.Validate(ctx)
-			if d := cmp.Diff(err.Error(), tc.want.Error()); d != "" {
+			if d := cmp.Diff(tc.want.Error(), err.Error()); d != "" {
 				t.Error(diff.PrintWantGot(d))
 			}
 		})
@@ -1447,7 +1447,7 @@ func TestPipelineRunSpecBetaFeatures(t *testing.T) {
 			}},
 		},
 	}, {
-		name: "pipeline tasks - use of resolver without the feature flag set",
+		name: "pipeline tasks - use of resolver",
 		spec: v1.PipelineSpec{
 			Tasks: []v1.PipelineTask{{
 				Name:    "uses-resolver",
@@ -1455,7 +1455,7 @@ func TestPipelineRunSpecBetaFeatures(t *testing.T) {
 			}},
 		},
 	}, {
-		name: "pipeline tasks - use of resolver params without the feature flag set",
+		name: "pipeline tasks - use of resolver params",
 		spec: v1.PipelineSpec{
 			Tasks: []v1.PipelineTask{{
 				Name:    "uses-resolver-params",
@@ -1463,7 +1463,7 @@ func TestPipelineRunSpecBetaFeatures(t *testing.T) {
 			}},
 		},
 	}, {
-		name: "finally tasks - use of resolver without the feature flag set",
+		name: "finally tasks - use of resolver",
 		spec: v1.PipelineSpec{
 			Tasks: []v1.PipelineTask{{
 				Name:    "valid-pipeline-task",
@@ -1475,7 +1475,7 @@ func TestPipelineRunSpecBetaFeatures(t *testing.T) {
 			}},
 		},
 	}, {
-		name: "finally tasks - use of resolver params without the feature flag set",
+		name: "finally tasks - use of resolver params",
 		spec: v1.PipelineSpec{
 			Tasks: []v1.PipelineTask{{
 				Name:    "valid-pipeline-task",

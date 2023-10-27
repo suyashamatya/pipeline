@@ -228,6 +228,21 @@ var customRuns = []v1beta1.CustomRun{{
 
 var matrixedPipelineTask = &v1.PipelineTask{
 	Name: "task",
+	TaskSpec: &v1.EmbeddedTask{
+		TaskSpec: v1.TaskSpec{
+			Params: []v1.ParamSpec{{
+				Name: "browser",
+				Type: v1.ParamTypeString,
+			}},
+			Results: []v1.TaskResult{{
+				Name: "BROWSER",
+			}},
+			Steps: []v1.Step{{
+				Name:   "produce-results",
+				Image:  "bash:latest",
+				Script: `#!/usr/bin/env bash\necho -n "$(params.browser)" | sha256sum | tee $(results.BROWSER.path)"`,
+			}},
+		}},
 	Matrix: &v1.Matrix{
 		Params: v1.Params{{
 			Name:  "browser",
@@ -2411,10 +2426,10 @@ func TestResolvePipelineRun_PipelineTaskHasNoResources(t *testing.T) {
 		TaskName: task.Name,
 		TaskSpec: &task.Spec,
 	}
-	if d := cmp.Diff(pipelineState[0].ResolvedTask, expectedTask, cmpopts.IgnoreUnexported(v1.TaskRunSpec{})); d != "" {
+	if d := cmp.Diff(expectedTask, pipelineState[0].ResolvedTask, cmpopts.IgnoreUnexported(v1.TaskRunSpec{})); d != "" {
 		t.Fatalf("Expected resources where only Tasks were resolved but actual differed %s", diff.PrintWantGot(d))
 	}
-	if d := cmp.Diff(pipelineState[1].ResolvedTask, expectedTask, cmpopts.IgnoreUnexported(v1.TaskRunSpec{})); d != "" {
+	if d := cmp.Diff(expectedTask, pipelineState[1].ResolvedTask, cmpopts.IgnoreUnexported(v1.TaskRunSpec{})); d != "" {
 		t.Fatalf("Expected resources where only Tasks were resolved but actual differed %s", diff.PrintWantGot(d))
 	}
 }
@@ -4725,6 +4740,261 @@ func TestIsRunning(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := tc.rpt.IsRunning(); got != tc.want {
 				t.Errorf("expected IsRunning: %t but got %t", tc.want, got)
+			}
+		})
+	}
+}
+
+func TestCreateResultsCacheMatrixedTaskRuns(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rpt  *ResolvedPipelineTask
+		want map[string][]string
+	}{{
+		name: "matrixed taskrun with results",
+		rpt: &ResolvedPipelineTask{
+			PipelineTask: matrixedPipelineTask,
+			TaskRuns: []*v1.TaskRun{{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "namespace",
+					Name:      "matrix-task-with-results",
+				},
+				Spec: v1.TaskRunSpec{},
+				Status: v1.TaskRunStatus{
+					TaskRunStatusFields: v1.TaskRunStatusFields{
+						Results: []v1.TaskRunResult{{
+							Name:  "browser",
+							Type:  "string",
+							Value: v1.ParamValue{Type: v1.ParamTypeString, StringVal: "chrome"},
+						}, {
+							Name:  "browser",
+							Type:  "string",
+							Value: v1.ParamValue{Type: v1.ParamTypeString, StringVal: "safari"},
+						}, {
+							Name:  "platform",
+							Type:  "string",
+							Value: v1.ParamValue{Type: v1.ParamTypeString, StringVal: "linux"},
+						}},
+					},
+				},
+			}},
+		},
+		want: map[string][]string{
+			"browser":  {"chrome", "safari"}, // 1 Child ref
+			"platform": {"linux"},            // 1 Child ref
+		},
+	}, {
+		name: "matrixed taskrun without results",
+		rpt: &ResolvedPipelineTask{
+			PipelineTask: matrixedPipelineTask,
+			TaskRuns: []*v1.TaskRun{{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "namespace",
+					Name:      "matrix-task-with-results",
+				},
+				Spec: v1.TaskRunSpec{},
+				Status: v1.TaskRunStatus{
+					TaskRunStatusFields: v1.TaskRunStatusFields{
+						Results: []v1.TaskRunResult{{}},
+					},
+				},
+			}},
+		},
+		want: map[string][]string{
+			"": {""},
+		},
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := createResultsCacheMatrixedTaskRuns(tc.rpt)
+			if !cmp.Equal(got, tc.want) {
+				t.Errorf("Did not get the expected ResultsCache for %s", tc.rpt.PipelineTask.Name)
+			}
+		})
+	}
+}
+
+func TestEvaluateCEL_valid(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rpt  *ResolvedPipelineTask
+		want map[string]bool
+	}{{
+		name: "empty CEL",
+		rpt: &ResolvedPipelineTask{
+			PipelineTask: &v1.PipelineTask{
+				When: v1.WhenExpressions{{
+					CEL: "",
+				}},
+			},
+		},
+		want: map[string]bool{},
+	}, {
+		name: "equal",
+		rpt: &ResolvedPipelineTask{
+			PipelineTask: &v1.PipelineTask{
+				When: v1.WhenExpressions{{
+					CEL: "'foo'=='foo'",
+				}},
+			},
+		},
+		want: map[string]bool{
+			"'foo'=='foo'": true,
+		},
+	}, {
+		name: "not equal",
+		rpt: &ResolvedPipelineTask{
+			PipelineTask: &v1.PipelineTask{
+				When: v1.WhenExpressions{{
+					CEL: "'bar'!='foo'",
+				}},
+			},
+		},
+		want: map[string]bool{
+			"'bar'!='foo'": true,
+		},
+	}, {
+		name: "in",
+		rpt: &ResolvedPipelineTask{
+			PipelineTask: &v1.PipelineTask{
+				When: v1.WhenExpressions{{
+					CEL: "'foo' in ['foo', 'bar']",
+				}},
+			},
+		},
+		want: map[string]bool{
+			"'foo' in ['foo', 'bar']": true,
+		},
+	}, {
+		name: "not in",
+		rpt: &ResolvedPipelineTask{
+			PipelineTask: &v1.PipelineTask{
+				When: v1.WhenExpressions{{
+					CEL: "!('duh' in ['foo', 'bar'])",
+				}},
+			},
+		},
+		want: map[string]bool{
+			"!('duh' in ['foo', 'bar'])": true,
+		},
+	}, {
+		name: "greater than",
+		rpt: &ResolvedPipelineTask{
+			PipelineTask: &v1.PipelineTask{
+				When: v1.WhenExpressions{{
+					CEL: "'0.95'>'0.9'",
+				}},
+			},
+		},
+		want: map[string]bool{
+			"'0.95'>'0.9'": true,
+		},
+	}, {
+		name: "less than",
+		rpt: &ResolvedPipelineTask{
+			PipelineTask: &v1.PipelineTask{
+				When: v1.WhenExpressions{{
+					CEL: "'0.85'<'0.9'",
+				}},
+			},
+		},
+		want: map[string]bool{
+			"'0.85'<'0.9'": true,
+		},
+	}, {
+		name: "or",
+		rpt: &ResolvedPipelineTask{
+			PipelineTask: &v1.PipelineTask{
+				When: v1.WhenExpressions{{
+					CEL: "'foo'=='foo'||false",
+				}},
+			},
+		},
+		want: map[string]bool{
+			"'foo'=='foo'||false": true,
+		},
+	}, {
+		name: "and",
+		rpt: &ResolvedPipelineTask{
+			PipelineTask: &v1.PipelineTask{
+				When: v1.WhenExpressions{{
+					CEL: "'foo'=='foo'&&true",
+				}},
+			},
+		},
+		want: map[string]bool{
+			"'foo'=='foo'&&true": true,
+		},
+	}, {
+		name: "regex",
+		rpt: &ResolvedPipelineTask{
+			PipelineTask: &v1.PipelineTask{
+				When: v1.WhenExpressions{{
+					CEL: "'release/v1'.matches('release/.*')",
+				}},
+			},
+		},
+		want: map[string]bool{
+			"'release/v1'.matches('release/.*')": true,
+		},
+	}, {
+		name: "multiple CEL when expressions",
+		rpt: &ResolvedPipelineTask{
+			PipelineTask: &v1.PipelineTask{
+				When: v1.WhenExpressions{{
+					CEL: "'foo'=='foo'",
+				}, {
+					CEL: "'foo'!='foo'",
+				}, {
+					CEL: "'foo'!='bar'",
+				}},
+			},
+		},
+		want: map[string]bool{
+			"'foo'!='bar'": true,
+			"'foo'!='foo'": false,
+			"'foo'=='foo'": true,
+		},
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.rpt.EvaluateCEL()
+			if err != nil {
+				t.Fatalf("Got unexpected err:%v", err)
+			}
+			if !cmp.Equal(tc.want, tc.rpt.EvaluatedCEL) {
+				t.Errorf("Did not get the expected EvaluatedCEL want %v, got: %v", tc.want, tc.rpt.EvaluatedCEL)
+			}
+		})
+	}
+}
+
+func TestEvaluateCEL_invalid(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rpt  *ResolvedPipelineTask
+	}{{
+		name: "compile error - token unrecogniezd",
+		rpt: &ResolvedPipelineTask{
+			PipelineTask: &v1.PipelineTask{
+				When: v1.WhenExpressions{{
+					CEL: "$(params.foo)=='foo'",
+				}},
+			},
+		},
+	}, {
+		name: "CEL result is not true or false",
+		rpt: &ResolvedPipelineTask{
+			PipelineTask: &v1.PipelineTask{
+				When: v1.WhenExpressions{{
+					CEL: "{'blue': '0x000080', 'red': '0xFF0000'}['red']",
+				}},
+			},
+		},
+	},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.rpt.EvaluateCEL()
+			if err == nil {
+				t.Fatalf("Expected err but got nil")
 			}
 		})
 	}

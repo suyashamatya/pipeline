@@ -34,10 +34,6 @@ import (
 	duckv1 "knative.dev/pkg/apis/duck/v1"
 )
 
-const (
-	breakpointOnFailure = "onFailure"
-)
-
 func TestTaskRunConversionBadType(t *testing.T) {
 	good, bad := &v1beta1.TaskRun{}, &v1beta1.Task{}
 
@@ -115,7 +111,9 @@ func TestTaskRunConversion(t *testing.T) {
 			},
 			Spec: v1beta1.TaskRunSpec{
 				Debug: &v1beta1.TaskRunDebug{
-					Breakpoint: []string{breakpointOnFailure},
+					Breakpoints: &v1beta1.TaskBreakpoints{
+						OnFailure: "enabled",
+					},
 				},
 				Params: v1beta1.Params{{
 					Name: "param-task-1",
@@ -407,6 +405,56 @@ func TestTaskRunConversionFromDeprecated(t *testing.T) {
 							},
 						},
 					},
+				},
+			},
+		},
+	}, {
+		name: "resourcesResult",
+		in: &v1beta1.TaskRun{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "foo",
+				Namespace: "bar",
+			},
+			Spec: v1beta1.TaskRunSpec{
+				TaskRef: &v1beta1.TaskRef{
+					Name: "test-resources-result",
+				},
+			},
+			Status: v1beta1.TaskRunStatus{
+				TaskRunStatusFields: v1beta1.TaskRunStatusFields{
+					ResourcesResult: []v1beta1.RunResult{{
+						Key:          "digest",
+						Value:        "sha256:1234",
+						ResourceName: "source-image",
+					}, {
+						Key:          "digest-11",
+						Value:        "sha256:1234",
+						ResourceName: "source-image",
+					}},
+				},
+			},
+		},
+		want: &v1beta1.TaskRun{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "foo",
+				Namespace: "bar",
+			},
+			Spec: v1beta1.TaskRunSpec{
+				TaskRef: &v1beta1.TaskRef{
+					Name: "test-resources-result",
+				},
+			},
+			Status: v1beta1.TaskRunStatus{
+				TaskRunStatusFields: v1beta1.TaskRunStatusFields{
+					ResourcesResult: []v1beta1.RunResult{{
+						Key:          "digest",
+						Value:        "sha256:1234",
+						ResourceName: "source-image",
+					}, {
+						Key:          "digest-11",
+						Value:        "sha256:1234",
+						ResourceName: "source-image",
+					}},
 				},
 			},
 		},

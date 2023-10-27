@@ -27,7 +27,6 @@ import (
 	"github.com/tektoncd/pipeline/pkg/apis/config"
 	"github.com/tektoncd/pipeline/pkg/apis/pipeline"
 	"github.com/tektoncd/pipeline/pkg/apis/validate"
-	"github.com/tektoncd/pipeline/pkg/apis/version"
 	"github.com/tektoncd/pipeline/pkg/substitution"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -70,6 +69,7 @@ func (t *Task) Validate(ctx context.Context) *apis.FieldError {
 
 // Validate implements apis.Validatable
 func (ts *TaskSpec) Validate(ctx context.Context) (errs *apis.FieldError) {
+	errs = errs.Also(ts.ValidateBetaFields(ctx))
 	if len(ts.Steps) == 0 {
 		errs = errs.Also(apis.ErrMissingField("steps"))
 	}
@@ -95,6 +95,35 @@ func (ts *TaskSpec) Validate(ctx context.Context) (errs *apis.FieldError) {
 	errs = errs.Also(validateResults(ctx, ts.Results).ViaField("results"))
 	if ts.Resources != nil {
 		errs = errs.Also(apis.ErrDisallowedFields("resources"))
+	}
+	return errs
+}
+
+// ValidateBetaFields returns an error if the TaskSpec uses beta specifications governed by
+// `enable-api-fields` but does not have "enable-api-fields" set to "alpha" or "beta".
+func (ts *TaskSpec) ValidateBetaFields(ctx context.Context) *apis.FieldError {
+	var errs *apis.FieldError
+	// Object parameters
+	for i, p := range ts.Params {
+		if p.Type == ParamTypeObject {
+			errs = errs.Also(config.ValidateEnabledAPIFields(ctx, "object type parameter", config.BetaAPIFields).ViaFieldIndex("params", i))
+		}
+	}
+	// Indexing into array parameters
+	arrayIndexParamRefs := ts.GetIndexingReferencesToArrayParams()
+	if len(arrayIndexParamRefs) != 0 {
+		errs = errs.Also(config.ValidateEnabledAPIFields(ctx, "indexing into array parameters", config.BetaAPIFields))
+	}
+	// Array and object results
+	for i, result := range ts.Results {
+		switch result.Type {
+		case ResultsTypeObject:
+			errs = errs.Also(config.ValidateEnabledAPIFields(ctx, "object results", config.BetaAPIFields).ViaFieldIndex("results", i))
+		case ResultsTypeArray:
+			errs = errs.Also(config.ValidateEnabledAPIFields(ctx, "array results", config.BetaAPIFields).ViaFieldIndex("results", i))
+		case ResultsTypeString:
+		default:
+		}
 	}
 	return errs
 }
@@ -194,7 +223,7 @@ func validateWorkspaceUsages(ctx context.Context, ts *TaskSpec) (errs *apis.Fiel
 
 	for stepIdx, step := range steps {
 		if len(step.Workspaces) != 0 {
-			errs = errs.Also(version.ValidateEnabledAPIFields(ctx, "step workspaces", config.BetaAPIFields).ViaIndex(stepIdx).ViaField("steps"))
+			errs = errs.Also(config.ValidateEnabledAPIFields(ctx, "step workspaces", config.BetaAPIFields).ViaIndex(stepIdx).ViaField("steps"))
 		}
 		for workspaceIdx, w := range step.Workspaces {
 			if !wsNames.Has(w.Name) {
@@ -205,7 +234,7 @@ func validateWorkspaceUsages(ctx context.Context, ts *TaskSpec) (errs *apis.Fiel
 
 	for sidecarIdx, sidecar := range sidecars {
 		if len(sidecar.Workspaces) != 0 {
-			errs = errs.Also(version.ValidateEnabledAPIFields(ctx, "sidecar workspaces", config.BetaAPIFields).ViaIndex(sidecarIdx).ViaField("sidecars"))
+			errs = errs.Also(config.ValidateEnabledAPIFields(ctx, "sidecar workspaces", config.BetaAPIFields).ViaIndex(sidecarIdx).ViaField("sidecars"))
 		}
 		for workspaceIdx, w := range sidecar.Workspaces {
 			if !wsNames.Has(w.Name) {
@@ -241,16 +270,52 @@ func validateSteps(ctx context.Context, steps []Step) (errs *apis.FieldError) {
 }
 
 func validateStep(ctx context.Context, s Step, names sets.String) (errs *apis.FieldError) {
-	if s.Image == "" {
-		errs = errs.Also(apis.ErrMissingField("Image"))
-	}
-
-	if s.Script != "" {
+	if s.Ref != nil {
+		if !config.FromContextOrDefaults(ctx).FeatureFlags.EnableStepActions {
+			return apis.ErrGeneric("feature flag %s should be set to true to reference StepActions in Steps.", config.EnableStepActions)
+		}
+		if s.Image != "" {
+			errs = errs.Also(&apis.FieldError{
+				Message: "image cannot be used with Ref",
+				Paths:   []string{"image"},
+			})
+		}
 		if len(s.Command) > 0 {
 			errs = errs.Also(&apis.FieldError{
-				Message: "script cannot be used with command",
+				Message: "command cannot be used with Ref",
+				Paths:   []string{"command"},
+			})
+		}
+		if len(s.Args) > 0 {
+			errs = errs.Also(&apis.FieldError{
+				Message: "args cannot be used with Ref",
+				Paths:   []string{"args"},
+			})
+		}
+		if s.Script != "" {
+			errs = errs.Also(&apis.FieldError{
+				Message: "script cannot be used with Ref",
 				Paths:   []string{"script"},
 			})
+		}
+		if s.Env != nil {
+			errs = errs.Also(&apis.FieldError{
+				Message: "env cannot be used with Ref",
+				Paths:   []string{"env"},
+			})
+		}
+	} else {
+		if s.Image == "" {
+			errs = errs.Also(apis.ErrMissingField("Image"))
+		}
+
+		if s.Script != "" {
+			if len(s.Command) > 0 {
+				errs = errs.Also(&apis.FieldError{
+					Message: "script cannot be used with command",
+					Paths:   []string{"script"},
+				})
+			}
 		}
 	}
 
@@ -297,19 +362,19 @@ func validateStep(ctx context.Context, s Step, names sets.String) (errs *apis.Fi
 	if s.Script != "" {
 		cleaned := strings.TrimSpace(s.Script)
 		if strings.HasPrefix(cleaned, "#!win") {
-			errs = errs.Also(version.ValidateEnabledAPIFields(ctx, "windows script support", config.AlphaAPIFields).ViaField("script"))
+			errs = errs.Also(config.ValidateEnabledAPIFields(ctx, "windows script support", config.AlphaAPIFields).ViaField("script"))
 		}
 	}
 
 	// StdoutConfig is an alpha feature and will fail validation if it's used in a task spec
 	// when the enable-api-fields feature gate is not "alpha".
 	if s.StdoutConfig != nil {
-		errs = errs.Also(version.ValidateEnabledAPIFields(ctx, "step stdout stream support", config.AlphaAPIFields).ViaField("stdoutconfig"))
+		errs = errs.Also(config.ValidateEnabledAPIFields(ctx, "step stdout stream support", config.AlphaAPIFields).ViaField("stdoutconfig"))
 	}
 	// StderrConfig is an alpha feature and will fail validation if it's used in a task spec
 	// when the enable-api-fields feature gate is not "alpha".
 	if s.StderrConfig != nil {
-		errs = errs.Also(version.ValidateEnabledAPIFields(ctx, "step stderr stream support", config.AlphaAPIFields).ViaField("stderrconfig"))
+		errs = errs.Also(config.ValidateEnabledAPIFields(ctx, "step stderr stream support", config.AlphaAPIFields).ViaField("stderrconfig"))
 	}
 	return errs
 }

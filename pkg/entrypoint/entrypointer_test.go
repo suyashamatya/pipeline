@@ -26,12 +26,14 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/tektoncd/pipeline/pkg/apis/config"
 	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
+	"github.com/tektoncd/pipeline/pkg/pod"
 	"github.com/tektoncd/pipeline/pkg/result"
 	"github.com/tektoncd/pipeline/pkg/spire"
 	"github.com/tektoncd/pipeline/pkg/termination"
@@ -602,10 +604,125 @@ func TestEntrypointerResults(t *testing.T) {
 	}
 }
 
-type fakeWaiter struct{ waited []string }
+func Test_waitingCancellation(t *testing.T) {
+	testCases := []struct {
+		name         string
+		expectCtxErr error
+	}{
+		{
+			name:         "stopOnCancel is true and want context canceled",
+			expectCtxErr: context.Canceled,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			fw := &fakeWaiter{}
+			err := Entrypointer{
+				Waiter: fw,
+			}.waitingCancellation(ctx, cancel)
+			if err != nil {
+				t.Fatalf("Entrypointer waitingCancellation failed: %v", err)
+			}
+			if tc.expectCtxErr != nil && !errors.Is(ctx.Err(), tc.expectCtxErr) {
+				t.Errorf("expected context error %v, got %v", tc.expectCtxErr, ctx.Err())
+			}
+		})
+	}
+}
 
-func (f *fakeWaiter) Wait(file string, _ bool, _ bool) error {
+func TestEntrypointerStopOnCancel(t *testing.T) {
+	testCases := []struct {
+		name                   string
+		runningDuration        time.Duration
+		waitingDuration        time.Duration
+		runningWaitingDuration time.Duration
+		expectError            error
+	}{
+		{
+			name:                   "generally running, expect no error",
+			runningDuration:        1 * time.Second,
+			runningWaitingDuration: 1 * time.Second,
+			waitingDuration:        2 * time.Second,
+			expectError:            nil,
+		},
+		{
+			name:                   "context canceled during running, expect context canceled error",
+			runningDuration:        2 * time.Second,
+			runningWaitingDuration: 2 * time.Second,
+			waitingDuration:        1 * time.Second,
+			expectError:            ErrContextCanceled,
+		},
+		{
+			name:                   "time exceeded during running, expect context deadline exceeded error",
+			runningDuration:        2 * time.Second,
+			runningWaitingDuration: 1 * time.Second,
+			waitingDuration:        1 * time.Second,
+			expectError:            ErrContextDeadlineExceeded,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			terminationPath := "termination"
+			if terminationFile, err := os.CreateTemp("", "termination"); err != nil {
+				t.Fatalf("unexpected error creating temporary termination file: %v", err)
+			} else {
+				terminationPath = terminationFile.Name()
+				defer os.Remove(terminationFile.Name())
+			}
+			fw := &fakeWaiter{waitCancelDuration: tc.waitingDuration}
+			fr := &fakeLongRunner{runningDuration: tc.runningDuration, waitingDuration: tc.runningWaitingDuration}
+			fp := &fakePostWriter{}
+			err := Entrypointer{
+				Waiter:          fw,
+				Runner:          fr,
+				PostWriter:      fp,
+				TerminationPath: terminationPath,
+			}.Go()
+			if !errors.Is(err, tc.expectError) {
+				t.Errorf("expected error %v, got %v", tc.expectError, err)
+			}
+		})
+	}
+}
+
+func TestIsContextDeadlineError(t *testing.T) {
+	ctxErr := ContextError(context.DeadlineExceeded.Error())
+	if !IsContextDeadlineError(ctxErr) {
+		t.Errorf("expected context deadline error, got %v", ctxErr)
+	}
+	normalErr := ContextError("normal error")
+	if IsContextDeadlineError(normalErr) {
+		t.Errorf("expected normal error, got %v", normalErr)
+	}
+}
+
+func TestIsContextCanceledError(t *testing.T) {
+	ctxErr := ContextError(context.Canceled.Error())
+	if !IsContextCanceledError(ctxErr) {
+		t.Errorf("expected context canceled error, got %v", ctxErr)
+	}
+	normalErr := ContextError("normal error")
+	if IsContextCanceledError(normalErr) {
+		t.Errorf("expected normal error, got %v", normalErr)
+	}
+}
+
+type fakeWaiter struct {
+	sync.Mutex
+	waited             []string
+	waitCancelDuration time.Duration
+}
+
+func (f *fakeWaiter) Wait(ctx context.Context, file string, _ bool, _ bool) error {
+	if file == pod.DownwardMountCancelFile && f.waitCancelDuration > 0 {
+		time.Sleep(f.waitCancelDuration)
+	} else if file == pod.DownwardMountCancelFile {
+		return nil
+	}
+	f.Lock()
 	f.waited = append(f.waited, file)
+	f.Unlock()
 	return nil
 }
 
@@ -633,7 +750,7 @@ func (f *fakePostWriter) Write(file, content string) {
 
 type fakeErrorWaiter struct{ waited *string }
 
-func (f *fakeErrorWaiter) Wait(file string, expectContent bool, breakpointOnFailure bool) error {
+func (f *fakeErrorWaiter) Wait(ctx context.Context, file string, expectContent bool, breakpointOnFailure bool) error {
 	f.waited = &file
 	return errors.New("waiter failed")
 }
@@ -670,6 +787,29 @@ type fakeExitErrorRunner struct{ args *[]string }
 func (f *fakeExitErrorRunner) Run(ctx context.Context, args ...string) error {
 	f.args = &args
 	return exec.Command("ls", "/bogus/path").Run()
+}
+
+type fakeLongRunner struct {
+	runningDuration time.Duration
+	waitingDuration time.Duration
+}
+
+func (f *fakeLongRunner) Run(ctx context.Context, _ ...string) error {
+	if f.waitingDuration < f.runningDuration {
+		return ErrContextDeadlineExceeded
+	}
+	select {
+	case <-time.After(f.runningDuration):
+		return nil
+	case <-ctx.Done():
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return ErrContextCanceled
+		}
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return ErrContextDeadlineExceeded
+		}
+		return nil
+	}
 }
 
 type fakeResultsWriter struct {

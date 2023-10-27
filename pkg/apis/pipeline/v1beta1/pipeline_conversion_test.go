@@ -60,7 +60,11 @@ func TestPipelineConversion(t *testing.T) {
 				Description: "test",
 				Tasks: []v1beta1.PipelineTask{{
 					Name:    "foo",
+					OnError: v1beta1.PipelineTaskContinue,
 					TaskRef: &v1beta1.TaskRef{Name: "example.com/my-foo-task"},
+					WhenExpressions: v1beta1.WhenExpressions{{
+						CEL: "'$(params.param-1)'=='foo'",
+					}},
 				}},
 				Params: []v1beta1.ParamSpec{{
 					Name:        "param-1",
@@ -138,11 +142,13 @@ func TestPipelineConversion(t *testing.T) {
 				DisplayName: "pipeline-display-name",
 				Description: "test",
 				Tasks: []v1beta1.PipelineTask{{
-					Name: "task-1",
+					Name:    "task-1",
+					OnError: v1beta1.PipelineTaskContinue,
 				}, {
 					Name:        "foo",
 					DisplayName: "task-display-name",
 					Description: "task-description",
+					OnError:     v1beta1.PipelineTaskContinue,
 					TaskRef:     &v1beta1.TaskRef{Name: "example.com/my-foo-task"},
 					TaskSpec: &v1beta1.EmbeddedTask{
 						TaskSpec: v1beta1.TaskSpec{
@@ -242,5 +248,73 @@ func TestPipelineConversion(t *testing.T) {
 				})
 			}
 		})
+	}
+}
+
+func TestPipelineConversionFromDeprecated(t *testing.T) {
+	tests := []struct {
+		name string
+		in   *v1beta1.Pipeline
+		want *v1beta1.Pipeline
+	}{{
+		name: "pipeline resources",
+		in: &v1beta1.Pipeline{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "foo",
+				Namespace: "bar",
+			},
+			Spec: v1beta1.PipelineSpec{
+				Resources: []v1beta1.PipelineDeclaredResource{
+					{
+						Name:     "1st pipeline resource",
+						Type:     v1beta1.PipelineResourceTypeGit,
+						Optional: true,
+					}, {
+						Name:     "2nd pipeline resource",
+						Type:     v1beta1.PipelineResourceTypeGit,
+						Optional: false,
+					},
+				},
+			}},
+		want: &v1beta1.Pipeline{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "foo",
+				Namespace: "bar",
+			},
+			Spec: v1beta1.PipelineSpec{
+				Resources: []v1beta1.PipelineDeclaredResource{
+					{
+						Name:     "1st pipeline resource",
+						Type:     v1beta1.PipelineResourceTypeGit,
+						Optional: true,
+					}, {
+						Name:     "2nd pipeline resource",
+						Type:     v1beta1.PipelineResourceTypeGit,
+						Optional: false,
+					},
+				},
+			},
+		},
+	}}
+
+	for _, test := range tests {
+		versions := []apis.Convertible{&v1.Pipeline{}}
+		for _, version := range versions {
+			t.Run(test.name, func(t *testing.T) {
+				ver := version
+				if err := test.in.ConvertTo(context.Background(), ver); err != nil {
+					t.Errorf("ConvertTo() = %v", err)
+				}
+				t.Logf("ConvertTo() = %#v", ver)
+				got := &v1beta1.Pipeline{}
+				if err := got.ConvertFrom(context.Background(), ver); err != nil {
+					t.Errorf("ConvertFrom() = %v", err)
+				}
+				t.Logf("ConvertFrom() = %#v", got)
+				if d := cmp.Diff(test.want, got); d != "" {
+					t.Errorf("roundtrip %s", diff.PrintWantGot(d))
+				}
+			})
+		}
 	}
 }
