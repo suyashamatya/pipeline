@@ -23,8 +23,9 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/authn/k8schain"
 	resolverconfig "github.com/tektoncd/pipeline/pkg/apis/config/resolver"
-	pipelinev1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
-	"github.com/tektoncd/pipeline/pkg/resolution/common"
+	v1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
+	"github.com/tektoncd/pipeline/pkg/apis/resolution/v1beta1"
+	common "github.com/tektoncd/pipeline/pkg/resolution/common"
 	"github.com/tektoncd/pipeline/pkg/resolution/resolver/framework"
 	"k8s.io/client-go/kubernetes"
 	"knative.dev/pkg/client/injection/kube/client"
@@ -33,19 +34,21 @@ import (
 const (
 	disabledError = "cannot handle resolution request, enable-bundles-resolver feature flag not true"
 
-	// LabelValueBundleResolverType is the value to use for the
-	// resolution.tekton.dev/type label on resource requests
-	LabelValueBundleResolverType string = "bundles"
-
 	// TODO(sbwsg): This should be exposed as a configurable option for
 	// admins (e.g. via ConfigMap)
 	timeoutDuration = time.Minute
+
+	// LabelValueBundleResolverType is the value to use for the
+	// resolution.tekton.dev/type label on resource requests
+	LabelValueBundleResolverType string = "bundles"
 
 	// BundleResolverName is the name that the bundle resolver should be associated with.
 	BundleResolverName = "bundleresolver"
 )
 
 // Resolver implements a framework.Resolver that can fetch files from OCI bundles.
+//
+// Deprecated: Use [github.com/tektoncd/pipeline/pkg/remoteresolution/resolver/bundle.Resolver] instead.
 type Resolver struct {
 	kubeClientSet kubernetes.Interface
 }
@@ -74,8 +77,44 @@ func (r *Resolver) GetSelector(context.Context) map[string]string {
 }
 
 // ValidateParams ensures parameters from a request are as expected.
-func (r *Resolver) ValidateParams(ctx context.Context, params []pipelinev1.Param) error {
-	if r.isDisabled(ctx) {
+func (r *Resolver) ValidateParams(ctx context.Context, params []v1.Param) error {
+	return ValidateParams(ctx, params)
+}
+
+// Resolve uses the given params to resolve the requested file or resource.
+func (r *Resolver) Resolve(ctx context.Context, params []v1.Param) (framework.ResolvedResource, error) {
+	return ResolveRequest(ctx, r.kubeClientSet, &v1beta1.ResolutionRequestSpec{Params: params})
+}
+
+// Resolve uses the given params to resolve the requested file or resource.
+func ResolveRequest(ctx context.Context, kubeClientSet kubernetes.Interface, req *v1beta1.ResolutionRequestSpec) (framework.ResolvedResource, error) {
+	if isDisabled(ctx) {
+		return nil, errors.New(disabledError)
+	}
+	opts, err := OptionsFromParams(ctx, req.Params)
+	if err != nil {
+		return nil, err
+	}
+	var imagePullSecrets []string
+	if opts.ImagePullSecret != "" {
+		imagePullSecrets = append(imagePullSecrets, opts.ImagePullSecret)
+	}
+	namespace := common.RequestNamespace(ctx)
+	kc, err := k8schain.New(ctx, kubeClientSet, k8schain.Options{
+		Namespace:          namespace,
+		ServiceAccountName: opts.ServiceAccount,
+		ImagePullSecrets:   imagePullSecrets,
+	})
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancelFn := context.WithTimeout(ctx, timeoutDuration)
+	defer cancelFn()
+	return GetEntry(ctx, kc, opts)
+}
+
+func ValidateParams(ctx context.Context, params []v1.Param) error {
+	if isDisabled(ctx) {
 		return errors.New(disabledError)
 	}
 	if _, err := OptionsFromParams(ctx, params); err != nil {
@@ -84,26 +123,7 @@ func (r *Resolver) ValidateParams(ctx context.Context, params []pipelinev1.Param
 	return nil
 }
 
-// Resolve uses the given params to resolve the requested file or resource.
-func (r *Resolver) Resolve(ctx context.Context, params []pipelinev1.Param) (framework.ResolvedResource, error) {
-	if r.isDisabled(ctx) {
-		return nil, errors.New(disabledError)
-	}
-	opts, err := OptionsFromParams(ctx, params)
-	if err != nil {
-		return nil, err
-	}
-	namespace := common.RequestNamespace(ctx)
-	kc, _ := k8schain.New(ctx, r.kubeClientSet, k8schain.Options{
-		Namespace:          namespace,
-		ServiceAccountName: opts.ServiceAccount,
-	})
-	ctx, cancelFn := context.WithTimeout(ctx, timeoutDuration)
-	defer cancelFn()
-	return GetEntry(ctx, kc, opts)
-}
-
-func (r *Resolver) isDisabled(ctx context.Context) bool {
+func isDisabled(ctx context.Context) bool {
 	cfg := resolverconfig.FromContextOrDefaults(ctx)
 	return !cfg.FeatureFlags.EnableBundleResolver
 }
