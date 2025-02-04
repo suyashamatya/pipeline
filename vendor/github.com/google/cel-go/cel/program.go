@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/google/cel-go/common/ast"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
 	"github.com/google/cel-go/interpreter"
@@ -99,13 +100,16 @@ type EvalDetails struct {
 // State of the evaluation, non-nil if the OptTrackState or OptExhaustiveEval is specified
 // within EvalOptions.
 func (ed *EvalDetails) State() interpreter.EvalState {
+	if ed == nil {
+		return interpreter.NewEvalState()
+	}
 	return ed.state
 }
 
 // ActualCost returns the tracked cost through the course of execution when `CostTracking` is enabled.
 // Otherwise, returns nil if the cost was not enabled.
 func (ed *EvalDetails) ActualCost() *uint64 {
-	if ed.costTracker == nil {
+	if ed == nil || ed.costTracker == nil {
 		return nil
 	}
 	cost := ed.costTracker.ActualCost()
@@ -129,10 +133,14 @@ type prog struct {
 	// Interpretable configured from an Ast and aggregate decorator set based on program options.
 	interpretable     interpreter.Interpretable
 	callCostEstimator interpreter.ActualCostEstimator
+	costOptions       []interpreter.CostTrackerOption
 	costLimit         *uint64
 }
 
 func (p *prog) clone() *prog {
+	costOptsCopy := make([]interpreter.CostTrackerOption, len(p.costOptions))
+	copy(costOptsCopy, p.costOptions)
+
 	return &prog{
 		Env:                     p.Env,
 		evalOpts:                p.evalOpts,
@@ -147,16 +155,17 @@ func (p *prog) clone() *prog {
 // ProgramOption values.
 //
 // If the program cannot be configured the prog will be nil, with a non-nil error response.
-func newProgram(e *Env, a *Ast, opts []ProgramOption) (Program, error) {
+func newProgram(e *Env, a *ast.AST, opts []ProgramOption) (Program, error) {
 	// Build the dispatcher, interpreter, and default program value.
 	disp := interpreter.NewDispatcher()
 
 	// Ensure the default attribute factory is set after the adapter and provider are
 	// configured.
 	p := &prog{
-		Env:        e,
-		decorators: []interpreter.InterpretableDecorator{},
-		dispatcher: disp,
+		Env:         e,
+		decorators:  []interpreter.InterpretableDecorator{},
+		dispatcher:  disp,
+		costOptions: []interpreter.CostTrackerOption{},
 	}
 
 	// Configure the program via the ProgramOption values.
@@ -182,10 +191,13 @@ func newProgram(e *Env, a *Ast, opts []ProgramOption) (Program, error) {
 
 	// Set the attribute factory after the options have been set.
 	var attrFactory interpreter.AttributeFactory
+	attrFactorOpts := []interpreter.AttrFactoryOption{
+		interpreter.EnableErrorOnBadPresenceTest(p.HasFeature(featureEnableErrorOnBadPresenceTest)),
+	}
 	if p.evalOpts&OptPartialEval == OptPartialEval {
-		attrFactory = interpreter.NewPartialAttributeFactory(e.Container, e.adapter, e.provider)
+		attrFactory = interpreter.NewPartialAttributeFactory(e.Container, e.adapter, e.provider, attrFactorOpts...)
 	} else {
-		attrFactory = interpreter.NewAttributeFactory(e.Container, e.adapter, e.provider)
+		attrFactory = interpreter.NewAttributeFactory(e.Container, e.adapter, e.provider, attrFactorOpts...)
 	}
 	interp := interpreter.NewInterpreter(disp, e.Container, e.provider, e.adapter, attrFactory)
 	p.interpreter = interp
@@ -213,6 +225,12 @@ func newProgram(e *Env, a *Ast, opts []ProgramOption) (Program, error) {
 		factory := func(state interpreter.EvalState, costTracker *interpreter.CostTracker) (Program, error) {
 			costTracker.Estimator = p.callCostEstimator
 			costTracker.Limit = p.costLimit
+			for _, costOpt := range p.costOptions {
+				err := costOpt(costTracker)
+				if err != nil {
+					return nil, err
+				}
+			}
 			// Limit capacity to guarantee a reallocation when calling 'append(decs, ...)' below. This
 			// prevents the underlying memory from being shared between factory function calls causing
 			// undesired mutations.
@@ -241,9 +259,9 @@ func newProgram(e *Env, a *Ast, opts []ProgramOption) (Program, error) {
 	return p.initInterpretable(a, decorators)
 }
 
-func (p *prog) initInterpretable(a *Ast, decs []interpreter.InterpretableDecorator) (*prog, error) {
+func (p *prog) initInterpretable(a *ast.AST, decs []interpreter.InterpretableDecorator) (*prog, error) {
 	// When the AST has been exprAST it contains metadata that can be used to speed up program execution.
-	interpretable, err := p.interpreter.NewInterpretable(a.impl, decs...)
+	interpretable, err := p.interpreter.NewInterpretable(a, decs...)
 	if err != nil {
 		return nil, err
 	}
@@ -325,7 +343,11 @@ type progGen struct {
 // the test is successful.
 func newProgGen(factory progFactory) (Program, error) {
 	// Test the factory to make sure that configuration errors are spotted at config
-	_, err := factory(interpreter.NewEvalState(), &interpreter.CostTracker{})
+	tracker, err := interpreter.NewCostTracker(nil)
+	if err != nil {
+		return nil, err
+	}
+	_, err = factory(interpreter.NewEvalState(), tracker)
 	if err != nil {
 		return nil, err
 	}
@@ -338,7 +360,10 @@ func (gen *progGen) Eval(input any) (ref.Val, *EvalDetails, error) {
 	// new EvalState instance for each call to ensure that unique evaluations yield unique stateful
 	// results.
 	state := interpreter.NewEvalState()
-	costTracker := &interpreter.CostTracker{}
+	costTracker, err := interpreter.NewCostTracker(nil)
+	if err != nil {
+		return nil, nil, err
+	}
 	det := &EvalDetails{state: state, costTracker: costTracker}
 
 	// Generate a new instance of the interpretable using the factory configured during the call to
@@ -366,7 +391,10 @@ func (gen *progGen) ContextEval(ctx context.Context, input any) (ref.Val, *EvalD
 	// new EvalState instance for each call to ensure that unique evaluations yield unique stateful
 	// results.
 	state := interpreter.NewEvalState()
-	costTracker := &interpreter.CostTracker{}
+	costTracker, err := interpreter.NewCostTracker(nil)
+	if err != nil {
+		return nil, nil, err
+	}
 	det := &EvalDetails{state: state, costTracker: costTracker}
 
 	// Generate a new instance of the interpretable using the factory configured during the call to
